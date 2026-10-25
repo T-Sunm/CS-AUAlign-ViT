@@ -4,9 +4,9 @@
 
 Xây dựng data pipeline cho setting:
 
-$$
+```math
 \text{RAF-DB} \rightarrow \text{ExpW}
-$$
+```
 
 trong đó:
 
@@ -14,9 +14,9 @@ trong đó:
 - ExpW là unlabeled target domain trong adaptation.
 - Cả hai sử dụng chung 7 expression classes:
 
-$$
+```math
 \{\text{anger}, \text{disgust}, \text{fear}, \text{happiness}, \text{neutral}, \text{sadness}, \text{surprise}\}.
-$$
+```
 
 Output của task phải có thể dùng trực tiếp cho source pretraining, target adaptation và STR ở các bước sau.
 
@@ -57,33 +57,33 @@ Facial landmarks phải được lưu lại để dùng cho STR sau này mà kh�
 
 ### Training
 
-$$
+```math
 \text{face crop} \rightarrow \text{resize} \rightarrow \text{horizontal flip }(p=0.5) \rightarrow \text{tensor} \rightarrow \text{normalize}.
-$$
+```
 
 Với configuration hiện tại:
 
-$$
+```math
 H = W = 224.
-$$
+```
 
 Normalization để configurable.
 
 Nếu sử dụng standard ImageNet-pretrained Swin thì mặc định:
 
-$$
+```math
 \mu = (0.485, 0.456, 0.406)
-$$
+```
 
-$$
+```math
 \sigma = (0.229, 0.224, 0.225).
-$$
+```
 
 ### Evaluation
 
-$$
+```math
 \text{face crop} \rightarrow \text{resize} \rightarrow \text{tensor} \rightarrow \text{normalize}.
-$$
+```
 
 Không sử dụng random augmentation khi evaluation.
 
@@ -93,17 +93,13 @@ Không sử dụng random augmentation khi evaluation.
 
 RAF-DB train trả về:
 
-$$
+```math
 (x_s, y_s).
-$$
+```
 
 ### Target Adaptation Dataset
 
-ExpW train trả về:
-
-$$
-(x_t, \text{sample\_id}).
-$$
+ExpW train trả về $x_t$ và `sample_id`.
 
 Không trả target ground-truth label.
 
@@ -111,9 +107,9 @@ Không trả target ground-truth label.
 
 RAF-DB test hoặc ExpW test trả về:
 
-$$
+```math
 (x, y).
-$$
+```
 
 `batch_size` phải được truyền từ training configuration. Cách ghép source-target batch không thuộc task này.
 
@@ -171,9 +167,9 @@ Task hoàn thành khi:
 - ExpW adaptation loader không expose target labels.
 - Với configuration hiện tại, sample sau online transform có shape:
 
-$$
+```math
 [3, 224, 224].
-$$
+```
 
 - Training và evaluation transforms được tách riêng.
 - Facial landmarks có thể truy xuất lại theo sample.
