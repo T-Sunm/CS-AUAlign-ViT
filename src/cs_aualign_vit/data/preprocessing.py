@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
+from .deduplication import exclude_raf_test_duplicates
 from .manifests import CLASSES, SCHEMA_VERSION, read_jsonl, sha256, write_json, write_jsonl
 from .readers import image_path
 
@@ -268,6 +269,8 @@ def preprocess(rows, image_root, output, detector, source_info, min_size=20, min
                     print(json.dumps(status), flush=True)
         by_id = {r["sample_id"]: r for r in completed}
         ordered = [by_id[r["sample_id"]] for r in rows]
+        ordered, excluded = exclude_raf_test_duplicates(ordered)
+        write_json(output / "excluded_duplicates.json", excluded)
         write_jsonl(output / "processed.jsonl", ordered)
         write_json(output / "summary.json", summarize(ordered, source_info))
         write_json(

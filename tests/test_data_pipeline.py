@@ -282,36 +282,105 @@ def test_loader_audit_rejects_a_split_with_no_usable_samples(tmp_path):
         check_loaders(output / "processed.jsonl", 1, {"transforms": {"image_size": 224}})
 
 
-def test_official_raf_overlap_is_reported_only_with_verified_native_partition(tmp_path):
+def test_raf_test_duplicates_are_excluded_and_auditor_rejects_overlap(tmp_path):
     import runpy
 
+    from cs_aualign_vit.data.datasets import FaceDataset
     from cs_aualign_vit.data.manifests import sha256
 
     _output, detector, rows, info = prepared_fixture(tmp_path)
     annotation = tmp_path / "annotation"
     info["annotation_sha256"] = sha256(annotation)
     (tmp_path / "test_00001.png").write_bytes((tmp_path / "train_00001.png").read_bytes())
+    # Retain an independent test image to exercise the evaluation loader.
+    Image.new("RGB", (48, 48), (5, 15, 25)).save(tmp_path / "test_00002.png")
+    annotation.write_text(annotation.read_text() + "\ntest_00002.png 7\n")
+    rows, _ = read_raf(annotation, tmp_path)
+    info["annotation_sha256"] = sha256(annotation)
     output = tmp_path / "native-overlap"
     preprocess(rows, tmp_path, output, detector, info)
-    audit = runpy.run_path("scripts/audit_data.py")["audit"]
     manifest = output / "processed.jsonl"
-    with pytest.raises(ValueError, match="Raw-image bytes cross splits"):
-        audit(manifest, verify_originals=True)
+    records = read_jsonl(manifest)
+    assert records[0]["usable"]
+    assert not records[1]["usable"]
+    assert records[1]["reject_reason"] == "duplicate_of_raf_train"
+    assert records[1]["split"] == "test" and records[1]["processed_path"] is None
+    assert len(FaceDataset(manifest, "source_train")) == 1
+    evaluation = FaceDataset(manifest, "evaluation")
+    assert [r["sample_id"] for r in evaluation.samples] == ["raf_db:test_00002.png"]
+    audit = runpy.run_path("scripts/audit_data.py")["audit"]
     evidence = audit(manifest, verify_originals=True, raf_annotation=annotation)
-    assert evidence["raw_hash_split_overlap"] == 1
+    assert evidence["raw_hash_split_overlap"] == 0
     assert evidence["official_raf_partition_verified"]
-    assert any("source test is not byte-disjoint" in note for note in evidence["limits"])
-
-    # Editing both copies of the split/label cannot bypass the original annotation.
+    # Restore the pre-filter journal: native annotations must not waive overlap.
+    write_jsonl(manifest, read_jsonl(output / "journal.jsonl"))
+    with pytest.raises(ValueError, match="duplicates train bytes"):
+        audit(manifest, raf_annotation=annotation)
+    # The migration command also filters old manifests, without changing them.
+    parent_hash = sha256(manifest)
+    migrate = runpy.run_path("scripts/exclude_raf_test_duplicates.py")["exclude_existing"]
+    derived = tmp_path / "deduplicated"
+    assert migrate(manifest, derived)["excluded_count"] == 1
+    assert sha256(manifest) == parent_hash
+    assert audit(derived / "processed.jsonl", verify_originals=True)["raw_hash_split_overlap"] == 0
+    with pytest.raises(FileExistsError):
+        migrate(manifest, derived)
+    # Editing both split manifests cannot bypass native label/role checks.
     for filename in ("processed.jsonl", "splits.jsonl"):
-        records = read_jsonl(output / filename)
+        records = read_jsonl(derived / filename)
         records[0].update(label=0, class_name="anger")
-        write_jsonl(output / filename, records)
+        write_jsonl(derived / filename, records)
     with pytest.raises(ValueError, match="official RAF labels/partition"):
-        audit(manifest, raf_annotation=annotation)
-    annotation.write_text("train_00001.png 6\ntest_00001.png 7")
-    with pytest.raises(ValueError, match="annotation checksum"):
-        audit(manifest, raf_annotation=annotation)
+        audit(derived / "processed.jsonl", raf_annotation=annotation)
+
+
+def test_raf_duplicate_filter_includes_rejected_train_and_preserves_other_rows():
+    from cs_aualign_vit.data.deduplication import exclude_raf_test_duplicates
+
+    rows = [
+        {
+            "dataset": "raf_db",
+            "split": "train",
+            "sample_id": "a",
+            "raw_sha256": "same",
+            "usable": False,
+        },
+        {
+            "dataset": "raf_db",
+            "split": "train",
+            "sample_id": "b",
+            "raw_sha256": "same",
+            "usable": True,
+        },
+        {
+            "dataset": "raf_db",
+            "split": "test",
+            "sample_id": "c",
+            "raw_sha256": "same",
+            "usable": True,
+        },
+        {
+            "dataset": "raf_db",
+            "split": "test",
+            "sample_id": "d",
+            "raw_sha256": "same",
+            "usable": True,
+        },
+        {
+            "dataset": "expw",
+            "split": "test",
+            "sample_id": "e",
+            "raw_sha256": "same",
+            "usable": True,
+        },
+    ]
+    filtered, excluded = exclude_raf_test_duplicates(rows)
+    assert filtered[:2] == rows[:2] and filtered[4] == rows[4]
+    assert rows[2]["usable"]  # Do not mutate the parent records.
+    assert [r["sample_id"] for r in excluded] == ["c", "d"]
+    assert excluded[0]["matching_train_ids"] == ["a", "b"]
+    assert not filtered[2]["usable"] and not filtered[3]["usable"]
+    assert exclude_raf_test_duplicates(filtered)[0] == filtered
 
 
 def test_raf_annotation_cannot_allow_expw_overlap(tmp_path):

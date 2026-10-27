@@ -39,6 +39,21 @@ def audit(manifest, verify_originals=False, raf_annotation=None):
         ):
             raise ValueError("Manifest differs from official RAF labels/partition")
         official_raf_verified = True
+    train_hashes = {
+        r["raw_sha256"]
+        for r in rows
+        if r["dataset"] == "raf_db" and r["split"] == "train" and r.get("raw_sha256")
+    }
+    for row in rows:
+        duplicate = (
+            row["dataset"] == "raf_db"
+            and row["split"] == "test"
+            and row.get("raw_sha256") in train_hashes
+        )
+        if duplicate and row["usable"]:
+            raise ValueError("RAF test image duplicates train bytes")
+        if row.get("reject_reason") == "duplicate_of_raf_train" and not duplicate:
+            raise ValueError("Invalid RAF duplicate exclusion")
     hashes = defaultdict(set)
     crop_shapes = set()
     originals_checked = 0
@@ -96,15 +111,7 @@ def audit(manifest, verify_originals=False, raf_annotation=None):
         "No model efficacy or training has been evaluated",
     ]
     if crossing:
-        if not official_raf_verified:
-            raise ValueError(
-                f"Raw-image bytes cross splits: {crossing}; RAF requires checksum-bound "
-                "--raf-annotation to verify its mandated official partition"
-            )
-        limits.append(
-            f"RAF official partition contains {crossing} identical-byte groups across splits; "
-            "official roles retained, so source test is not byte-disjoint"
-        )
+        raise ValueError(f"Raw-image bytes cross splits: {crossing}")
     return {
         "state": "validated",
         "manifest_sha256": sha256(manifest),

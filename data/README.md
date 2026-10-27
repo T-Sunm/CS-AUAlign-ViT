@@ -114,13 +114,28 @@ the recorded bounding box in its original input image exactly; original hashes
 and sizes must agree. A split with input records but no usable samples fails
 the loader check rather than being silently skipped.
 
-RAF must retain the official partition. The supplied original release has three
-byte-identical image groups (eight rows) spanning official train/test. The audit
-reports this limitation after verifying every row against the checksum-bound
-original annotation supplied through `--raf-annotation`; it does not move or
-delete those rows. Without that verification, cross-split bytes fail the audit.
-ExpW still requires zero cross-split byte overlap. RAF source-test measurements
-must disclose this official-partition limitation.
+RAF retains official sample roles and all training rows, but excludes usable test
+images whose original SHA-256 matches any training image. Such test rows remain
+in the manifest with `usable=false`, `processed_path=null` and rejection reason
+`duplicate_of_raf_train`; `excluded_duplicates.json` records their matching train
+IDs. The supplied release has four such test rows in three content groups.
+The evaluation loader skips them. The audit rejects train/test byte overlap even
+when native RAF annotations are supplied; `--raf-annotation` independently checks
+that original labels and roles were preserved.
+
+New preparation applies this policy automatically. To derive a clean preparation
+from existing crops without running MTCNN again, use a new output directory:
+
+```bash
+uv run --python 3.12 python scripts/exclude_raf_test_duplicates.py \
+  --manifest /path/to/output/raf-v3/processed.jsonl \
+  --output /path/to/output/raf-v4-deduplicated
+```
+
+The command copies usable crops, preserves input splits/labels and records the
+parent manifest checksum. Existing inputs are unchanged. Audit and train/evaluate
+using the new manifest. This removes exact-byte overlap; near duplicates or shared
+identities still require a separate audit.
 
 ```python
 from cs_aualign_vit.data.datasets import build_loader
