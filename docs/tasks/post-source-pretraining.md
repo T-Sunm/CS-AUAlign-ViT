@@ -20,19 +20,24 @@ Sau source pretraining, target prototype bank được khởi tạo bằng cách
 M_t \leftarrow M_s^{src}.
 ```
 
-Checkpoint của task này được dùng làm source initialization cho Task 3.
+Checkpoint `best.pt` của task này được dùng làm source initialization cho Task 3.
+Checkpoint `last.pt` lưu trạng thái mới nhất để resume.
 
 ## 2. Source Data and Backbone
 
 ### Source data
 
-Sử dụng trực tiếp RAF-DB train loader của Task 1. Mỗi sample trả về:
+Sử dụng RAF-DB official train của Task 1. Tách stratified cố định 10% trong
+official train làm source validation bằng seed trong training configuration;
+90% còn lại dùng để tối ưu model. RAF-DB official test không tham gia chọn
+checkpoint. Mỗi training sample trả về:
 
 ```math
 (x_s, y_s).
 ```
 
 Task 2 chỉ sử dụng labeled source data. ExpW và các target input không tham gia source pretraining.
+Validation dùng evaluation transform, không có random horizontal flip.
 
 ### Backbone
 
@@ -117,7 +122,10 @@ Cấu hình training mặc định:
 - momentum: $0.9$;
 - weight decay: $0.001$;
 - learning-rate schedule: cosine;
-- input size: $224 \times 224$.
+- input size: $224 \times 224$;
+- validation ratio: $0.1$, stratified theo class và reproducible bằng fixed seed;
+- checkpoint selection: validation accuracy;
+- early stopping patience: configurable.
 
 Các giá trị trên lấy từ POST training recipe và phải configurable vì paper không báo cáo schedule riêng cho source pretraining. `source_pretrain_epochs` cũng phải configurable; không mặc định gán 256 epochs.
 
@@ -159,7 +167,8 @@ Checkpoint phải đủ thông tin để Task 3 restore trực tiếp:
 - class mapping;
 - backbone configuration;
 - preprocessing configuration;
-- training configuration.
+- training configuration;
+- validation split configuration và early-stopping state.
 
 ### Target prototype initialization
 
@@ -174,6 +183,9 @@ Task hoàn thành khi:
 - Prototype prediction có shape $[B,7]$.
 - $L_s$ backward được qua cả backbone và $M_s$.
 - Training cập nhật cả backbone và prototypes.
+- Validation subset cố định, stratified và không dùng training augmentation.
+- `best.pt` được chọn bằng source validation accuracy.
+- RAF-DB official test không được dùng để chọn checkpoint hoặc early stopping.
 - Source pretraining không phụ thuộc target data.
 - Checkpoint restore được source backbone và $M_s$.
 - $M_t$ được copy từ $M_s$ nhưng không chia sẻ parameter storage.
