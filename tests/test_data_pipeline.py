@@ -184,6 +184,33 @@ def test_source_interface(tmp_path):
     assert len(source) == 1 and source[0][1] == 6
 
 
+def test_loader_keeps_global_rng_state_and_rejects_escaping_crop_path(tmp_path):
+    import random
+
+    import torch
+
+    from cs_aualign_vit.data.datasets import FaceDataset, build_loader
+
+    output, *_ = prepared_fixture(tmp_path)
+    manifest = output / "processed.jsonl"
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    build_loader(manifest, "source_train", batch_size=1, seed=42)
+    assert random.getstate() == python_state
+    current_numpy_state = np.random.get_state()
+    assert current_numpy_state[0] == numpy_state[0]
+    assert np.array_equal(current_numpy_state[1], numpy_state[1])
+    assert current_numpy_state[2:] == numpy_state[2:]
+    assert torch.equal(torch.get_rng_state(), torch_state)
+
+    rows = read_jsonl(manifest)
+    rows[0]["processed_path"] = "../outside.png"
+    write_jsonl(manifest, rows)
+    with pytest.raises(ValueError, match="escapes preparation output"):
+        FaceDataset(manifest, "source_train")
+
+
 def test_corrupt_image_after_good_image_is_rejected(tmp_path):
     _output, detector, rows, info = prepared_fixture(tmp_path)
     (tmp_path / "test_00001.png").write_bytes(b"not an image")

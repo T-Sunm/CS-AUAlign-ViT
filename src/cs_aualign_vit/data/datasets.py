@@ -40,9 +40,12 @@ class FaceDataset(Dataset):
         for row in rows:
             if row["split"] != split or not row["usable"]:
                 continue
+            processed_path = (manifest.parent / row["processed_path"]).resolve()
+            if not processed_path.is_relative_to(manifest.parent):
+                raise ValueError("Crop path escapes preparation output")
             record = {
                 "sample_id": row["sample_id"],
-                "processed_path": str((manifest.parent / row["processed_path"]).resolve()),
+                "processed_path": str(processed_path),
                 "landmarks_crop": row["landmarks_crop"],
                 "landmarks_original": row["landmarks_original"],
                 "bbox": row["bbox"],
@@ -84,9 +87,6 @@ def build_loader(
     mean=(0.485, 0.456, 0.406),
     std=(0.229, 0.224, 0.225),
 ):
-    import random
-
-    import numpy as np
     import torch
 
     if batch_size <= 0:
@@ -95,10 +95,6 @@ def build_loader(
         manifest, role, split, build_transform(role != "evaluation", image_size, mean, std)
     )
     generator = torch.Generator().manual_seed(seed)
-    # torch seeds each worker; seed Python/NumPy as well for future transforms.
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
     return DataLoader(
         dataset,
         batch_size=batch_size,
