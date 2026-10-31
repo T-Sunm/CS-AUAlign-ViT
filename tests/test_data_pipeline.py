@@ -153,10 +153,17 @@ def test_role_interfaces_and_online_transforms(tmp_path):
     output, *_ = prepared_fixture(tmp_path, "expw")
     manifest = output / "processed.jsonl"
     target = FaceDataset(manifest, "target_adaptation")
+    target_features = FaceDataset(manifest, "target_features")
     image, sid = target[0]
     assert image.shape == (3, 224, 224) and torch.isfinite(image).all()
     assert isinstance(sid, str) and "label" not in target.metadata(sid)
     assert all("label" not in sample for sample in target.samples)
+    assert [sample["sample_id"] for sample in target_features.samples] == [
+        sample["sample_id"] for sample in target.samples
+    ]
+    assert target_features[0][1] == sid
+    assert torch.equal(target_features[0][0], target_features[0][0])
+    assert all("label" not in sample for sample in target_features.samples)
     target.metadata(sid)["landmarks_crop"][0][0] = 999
     assert target.metadata(sid)["landmarks_crop"][0][0] != 999
     evaluation = FaceDataset(manifest, "evaluation")
@@ -168,6 +175,8 @@ def test_role_interfaces_and_online_transforms(tmp_path):
         FaceDataset(manifest, "source_train")
     loader = build_loader(manifest, "target_adaptation", batch_size=1)
     assert next(iter(loader))[0].shape == (1, 3, 224, 224)
+    feature_loader = build_loader(manifest, "target_features", batch_size=1)
+    assert next(iter(feature_loader))[1] == (sid,)
     with Image.open(target.samples[0]["processed_path"]) as crop:
         transform = build_transform(True, 32, (0, 0, 0), (1, 1, 1))
         outputs = [transform(crop) for _ in range(20)]

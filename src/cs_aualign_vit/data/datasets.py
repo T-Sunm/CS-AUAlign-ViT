@@ -11,7 +11,7 @@ from .transforms import build_transform
 
 class FaceDataset(Dataset):
     def __init__(self, manifest, role, split=None, transform=None):
-        allowed = {"source_train", "target_adaptation", "evaluation"}
+        allowed = {"source_train", "target_adaptation", "target_features", "evaluation"}
         if role not in allowed:
             raise ValueError(f"role must be one of {sorted(allowed)}")
         manifest = Path(manifest).resolve()
@@ -24,8 +24,8 @@ class FaceDataset(Dataset):
         dataset = next(iter(datasets))
         if role == "source_train" and dataset != "raf_db":
             raise ValueError("Source training requires RAF-DB")
-        if role == "target_adaptation" and dataset != "expw":
-            raise ValueError("Target adaptation requires ExpW")
+        if role in {"target_adaptation", "target_features"} and dataset != "expw":
+            raise ValueError("Target roles require ExpW")
         if role != "evaluation":
             if split not in (None, "train"):
                 raise ValueError("Training roles must use train split")
@@ -35,7 +35,7 @@ class FaceDataset(Dataset):
             if split not in {"validation", "test"}:
                 raise ValueError("Evaluation requires validation/test")
         self.role = role
-        self.transform = transform or build_transform(role != "evaluation")
+        self.transform = transform or build_transform(role in {"source_train", "target_adaptation"})
         self.samples = []
         for row in rows:
             if row["split"] != split or not row["usable"]:
@@ -50,7 +50,7 @@ class FaceDataset(Dataset):
                 "landmarks_original": row["landmarks_original"],
                 "bbox": row["bbox"],
             }
-            if role != "target_adaptation":
+            if role not in {"target_adaptation", "target_features"}:
                 record["label"] = row["label"]
             self.samples.append(record)
         if not self.samples:
@@ -65,7 +65,9 @@ class FaceDataset(Dataset):
         with Image.open(record["processed_path"]) as image:
             tensor = self.transform(image.convert("RGB"))
         return tensor, (
-            record["sample_id"] if self.role == "target_adaptation" else record["label"]
+            record["sample_id"]
+            if self.role in {"target_adaptation", "target_features"}
+            else record["label"]
         )
 
     def metadata(self, sample_id):
@@ -92,13 +94,16 @@ def build_loader(
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     dataset = FaceDataset(
-        manifest, role, split, build_transform(role != "evaluation", image_size, mean, std)
+        manifest,
+        role,
+        split,
+        build_transform(role in {"source_train", "target_adaptation"}, image_size, mean, std),
     )
     generator = torch.Generator().manual_seed(seed)
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=role != "evaluation",
+        shuffle=role in {"source_train", "target_adaptation"},
         num_workers=num_workers,
         generator=generator,
         worker_init_fn=_seed_worker,
