@@ -220,3 +220,105 @@ def test_adversarial_config_mismatch_fails_load(tmp_path):
     other.adversarial_module.hidden_dim = 8
     with pytest.raises(ValueError, match="adversarial configuration"):
         other.load_checkpoint()
+
+
+# ---- real STR resampler on a small image fixture -------------------------------------
+def build_real(tmp_path, *, config, target_colors=(1, 1, 1, 1)):
+    from str_helpers import TinyImageModel, make_banks, make_source, make_target
+
+    from cs_aualign_vit.data.datasets import FaceDataset, build_loader, build_source_loader
+    from cs_aualign_vit.models import AdversarialAlignment
+    from cs_aualign_vit.training.self_training_resampling import SelfTrainingResampler
+
+    source = make_source(tmp_path / "src", {0: 4, 1: 2})
+    target = make_target(tmp_path / "tgt", list(target_colors))
+    model, banks = TinyImageModel(), make_banks()
+    adversary = AdversarialAlignment(input_dim=2, hidden_dim=4, dropout=0.0)
+    optimizer = torch.optim.SGD(
+        [*model.parameters(), *banks.parameters(), *adversary.parameters()], lr=0.001
+    )
+    feature_loader = build_loader(target, "target_features", batch_size=2)
+    resampler = SelfTrainingResampler(
+        source_manifest=source,
+        target_feature_loader=feature_loader,
+        prototype_banks=banks,
+        output_dir=tmp_path / "run" / "str",
+        global_seed=3,
+        batch_size=2,
+        device="cpu",
+        num_classes=2,
+    )
+    trainer = AdaptationTrainer(
+        model=model,
+        prototype_banks=banks,
+        adversarial_module=adversary,
+        optimizer=optimizer,
+        scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.max_epochs),
+        source_loader=build_source_loader([source], batch_size=2, drop_last=True, seed=3),
+        target_loader=build_loader(target, "target_adaptation", batch_size=2, drop_last=True),
+        target_feature_loader=feature_loader,
+        target_sample_ids=[s["sample_id"] for s in FaceDataset(target, "target_features").samples],
+        device="cpu",
+        checkpoint_path=tmp_path / "run" / "adaptation.pt",
+        config=config,
+        str_service=resampler,
+    )
+    return trainer, resampler, source
+
+
+def test_ten_boundaries_over_full_schedule_add_images_and_keep_isolation(tmp_path):
+    config = AdaptationConfig(kmeans_interval=10, num_classes=2)
+    trainer, resampler, source = build_real(tmp_path, config=config)
+    source_bytes = source.read_bytes()
+    history = trainer.run()
+
+    assert len(history) == 256 and trainer.completed_epoch == 256
+    transactions = [resampler.get_transaction(r) for r in range(1, 11)]
+    assert all(t["status"] == "completed" for t in transactions)
+    assert transactions[0]["created"] == 4 and all(t["created"] == 0 for t in transactions[1:])
+    assert len(trainer.source_loader.dataset) == 6 + 4
+    assert source.read_bytes() == source_bytes
+    from cs_aualign_vit.data.manifests import read_jsonl
+
+    rows = read_jsonl(resampler.manifest_path)
+    assert {r["dataset"] for r in rows} == {"raf_db"} and len({r["target_id"] for r in rows}) == 4
+    assert all("label" not in s for s in trainer.target_loader.dataset.samples)
+
+
+def test_empty_round_does_not_stop_training(tmp_path):
+    config = AdaptationConfig(max_epochs=3, kmeans_interval=1, str_epochs=(1,), num_classes=2)
+    trainer, resampler, _ = build_real(tmp_path, config=config, target_colors=(0, 0, 0, 0))
+    trainer.run()
+    assert resampler.get_transaction(1)["created"] == 0
+    assert trainer.completed_epoch == 3 and len(trainer.source_loader.dataset) == 6
+
+
+def test_resume_after_completed_round_restores_str_images(tmp_path):
+    config = AdaptationConfig(max_epochs=3, kmeans_interval=1, str_epochs=(1,), num_classes=2)
+    trainer, *_ = build_real(tmp_path, config=config)
+    trainer.run()
+    assert len(trainer.source_loader.dataset) == 10
+
+    resumed, resampler, _ = build_real(tmp_path, config=config)
+    resumed.load_checkpoint()
+    assert len(resumed.source_loader.dataset) == 6  # fresh loader, before restore
+    assert resumed.run() == []
+    assert len(resumed.source_loader.dataset) == 10
+    assert resampler.get_transaction(1)["status"] == "completed"
+
+
+def test_snapshot_is_written_before_main_checkpoint(tmp_path, monkeypatch):
+    config = AdaptationConfig(max_epochs=2, kmeans_interval=1, str_epochs=(2,), num_classes=2)
+    trainer, *_ = build_real(tmp_path, config=config)
+    original = trainer._atomic_save
+
+    def crash_on_main(state, path):
+        if state["completed_epoch"] == 2 and path == trainer.checkpoint_path:
+            raise OSError("crash")
+        original(state, path)
+
+    monkeypatch.setattr(trainer, "_atomic_save", crash_on_main)
+    with pytest.raises(OSError):
+        trainer.run()
+    assert trainer._boundary_checkpoint_path().exists()
+    assert torch.load(trainer.checkpoint_path, weights_only=True)["completed_epoch"] == 1
