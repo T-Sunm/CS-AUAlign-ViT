@@ -14,13 +14,11 @@ Output của task gồm:
 \theta_{\mathrm{Swin}}^{src}, \qquad M_s^{src}.
 ```
 
-Sau source pretraining, target prototype bank được khởi tạo bằng cách copy:
+Task 2.2 dùng $M_s^{src}$ từ checkpoint để khởi tạo hai prototype banks
+cho adaptation, bao gồm việc copy giá trị sang $M_t$. Task 2.1 không tạo $M_t$.
 
-```math
-M_t \leftarrow M_s^{src}.
-```
-
-Checkpoint `best.pt` của task này được dùng làm source initialization cho Task 3.
+Checkpoint `best.pt` của task này được dùng làm source initialization cho Task 3
+và Task 2.2.
 Checkpoint `last.pt` lưu trạng thái mới nhất để resume.
 
 ## 2. Source Data and Backbone
@@ -36,14 +34,14 @@ checkpoint. Mỗi training sample trả về:
 (x_s, y_s).
 ```
 
-Task 2 chỉ sử dụng labeled source data. ExpW và các target input không tham gia source pretraining.
+Task 2.1 chỉ sử dụng labeled source data. ExpW và các target input không tham gia source pretraining.
 Validation dùng evaluation transform, không có random horizontal flip.
 
 ### Backbone
 
 Sử dụng Swin-Transformer-Tiny pretrained trên ImageNet, với input size mặc định $224 \times 224$. USTST, tiền thân trực tiếp của POST, sử dụng cấu hình backbone này để xây Cross-Swin Transformer.
 
-Trong Task 2 chỉ chạy source self-attention path:
+Trong Task 2.1 chỉ chạy source self-attention path:
 
 ```math
 x_s \rightarrow F_s, \qquad F_s \in \mathbb{R}^{B \times m}.
@@ -103,7 +101,7 @@ L_s
 L_{\mathrm{CE}}(z_s^i, y_s^i).
 ```
 
-Trong Task 2:
+Trong Task 2.1:
 
 ```math
 L_{\mathrm{pretrain}} = L_s.
@@ -129,21 +127,12 @@ Cấu hình training mặc định:
 
 Các giá trị trên lấy từ POST training recipe và phải configurable vì paper không báo cáo schedule riêng cho source pretraining. `source_pretrain_epochs` cũng phải configurable; không mặc định gán 256 epochs.
 
-## 5. Target Prototype Initialization
+## 5. Handoff sang adaptation
 
-Sau khi hoàn tất source pretraining, tạo target prototype bank $M_t$ và copy giá trị từ $M_s^{src}$:
-
-```math
-M_t \leftarrow M_s^{src}.
-```
-
-Ngay sau initialization, hai bank bằng nhau về giá trị:
-
-```math
-M_t = M_s.
-```
-
-$M_t$ và $M_s$ là hai learnable parameter banks độc lập, không chia sẻ parameter storage. POST quy định target prototypes được khởi tạo từ pretrained source prototypes.
+Task 2.1 xuất source-pretraining checkpoint chứa $M_s^{src}$ và backbone đã học.
+Task 2.2 đọc checkpoint này, dựng $M_s$ và tạo $M_t$ có cùng giá trị ban đầu
+nhưng là parameter độc lập. Việc khởi tạo và restore $M_t$ thuộc Task 2.2,
+không thuộc source-pretraining pipeline.
 
 Task 3 quyết định cách đưa source-pretrained Swin weights vào source path và target path, cũng như cách tổ chức parameter sharing trong BCS.
 
@@ -159,7 +148,8 @@ Pipeline chạy end-to-end trên RAF-DB train của Task 1 và tạo:
 
 ### Checkpoint
 
-Checkpoint phải đủ thông tin để Task 3 restore trực tiếp:
+Checkpoint phải đủ thông tin để Task 3 dựng backbone và Task 2.2 dựng
+prototype banks:
 
 - Swin-Tiny weights;
 - source prototype bank;
@@ -169,10 +159,6 @@ Checkpoint phải đủ thông tin để Task 3 restore trực tiếp:
 - preprocessing configuration;
 - training configuration;
 - validation split configuration và early-stopping state.
-
-### Target prototype initialization
-
-Cung cấp cách tạo $M_t$ từ $M_s^{src}$ sao cho hai bank có cùng giá trị ban đầu nhưng là các parameters độc lập.
 
 ## 7. Acceptance Criteria
 
@@ -188,5 +174,5 @@ Task hoàn thành khi:
 - RAF-DB official test không được dùng để chọn checkpoint hoặc early stopping.
 - Source pretraining không phụ thuộc target data.
 - Checkpoint restore được source backbone và $M_s$.
-- $M_t$ được copy từ $M_s$ nhưng không chia sẻ parameter storage.
-- Output checkpoint có thể được Task 3 sử dụng trực tiếp.
+- Output checkpoint chứa đủ backbone state cho Task 3 và source prototype
+  state cùng metadata cho Task 2.2.

@@ -1,5 +1,6 @@
 """Training utilities."""
 
+from .adaptation import AdaptationConfig, AdaptationTrainer
 from .prototype_learning import PrototypeLosses, compute_prototype_losses
 from .source_pretraining import evaluate, load_checkpoint, save_checkpoint, train_epoch
 from .target_supervision import (
@@ -9,6 +10,8 @@ from .target_supervision import (
 )
 
 __all__ = [
+    "AdaptationConfig",
+    "AdaptationTrainer",
     "PrototypeLosses",
     "TargetSupervision",
     "compute_prototype_losses",
