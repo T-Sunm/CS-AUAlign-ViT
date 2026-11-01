@@ -14,7 +14,7 @@ from cs_aualign_vit.training.target_supervision import (
     refresh_target_supervision,
 )
 
-ADAPTATION_CHECKPOINT_VERSION = 1
+ADAPTATION_CHECKPOINT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -194,6 +194,7 @@ class AdaptationTrainer:
             "num_trusted": losses.num_trusted,
             "trusted_ratio": losses.num_trusted / len(source_images),
             "learning_rate": self.optimizer.param_groups[0]["lr"],
+            **getattr(self.adversarial_module, "last_metrics", {}),
         }
 
     def train_epoch(self):
@@ -286,6 +287,7 @@ class AdaptationTrainer:
             "model_state_dict": self.model.state_dict(),
             "prototype_state_dict": self.prototype_banks.state_dict(),
             "adversarial_state_dict": self.adversarial_module.state_dict(),
+            "adversarial_config": self.adversarial_module.config(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "scaler_state_dict": self.scaler.state_dict() if self.scaler is not None else None,
@@ -339,6 +341,8 @@ class AdaptationTrainer:
             raise ValueError("Saved class mapping differs from the current run")
         if state.get("feature_dim") != self.prototype_banks.source_prototypes.shape[1]:
             raise ValueError("Saved feature dimension differs from the current model")
+        if state.get("adversarial_config") != self.adversarial_module.config():
+            raise ValueError("Saved adversarial configuration differs from the current run")
         self.model.load_state_dict(state["model_state_dict"])
         self.prototype_banks.load_state_dict(state["prototype_state_dict"])
         self.adversarial_module.load_state_dict(state["adversarial_state_dict"])

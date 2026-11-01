@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
-from cs_aualign_vit.models import BCSFeatures, PrototypeBanks
+from cs_aualign_vit.models import AdversarialAlignment, BCSFeatures, PrototypeBanks
 from cs_aualign_vit.training import AdaptationConfig, AdaptationTrainer, TargetSupervision
 
 
@@ -33,15 +33,6 @@ class TinyBCS(nn.Module):
 
     def forward_target_features(self, target):
         return self.projection(target)
-
-
-class TinyAdversary(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(1.0))
-
-    def forward(self, source, target):
-        return self.scale * (source.mean() - target.mean()).square()
 
 
 class FakeSTR:
@@ -90,7 +81,7 @@ def build_trainer(tmp_path, *, config=None, str_service=None, refresh_fn=None):
     feature_loader = DataLoader(target, batch_size=2, shuffle=False)
     model = TinyBCS()
     banks = PrototypeBanks(torch.eye(2))
-    adversary = TinyAdversary()
+    adversary = AdversarialAlignment(input_dim=2, hidden_dim=4, dropout=0.0)
     optimizer = torch.optim.SGD(
         [*model.parameters(), *banks.parameters(), *adversary.parameters()], lr=0.01
     )
@@ -151,7 +142,9 @@ def test_loss_is_assembled_once_with_baseline_weights(tmp_path):
     assert trainer.model.projection.weight.grad is not None
     assert trainer.prototype_banks.source_prototypes.grad is not None
     assert trainer.prototype_banks.target_prototypes.grad is not None
-    assert trainer.adversarial_module.scale.grad is not None
+    assert all(p.grad is not None for p in trainer.adversarial_module.parameters())
+    for key in ("acc_s", "acc_t", "acc_balanced"):
+        assert key in metrics
 
 
 def test_empty_paired_loader_fails_with_actionable_context(tmp_path):
@@ -206,3 +199,24 @@ def test_completed_boundary_rejects_inconsistent_live_str_state(tmp_path, status
         match=f"epoch=1, expected_round_id=1, boundary=completed, transaction={'absent' if status is None else status}",
     ):
         trainer._finish_pending_boundary()
+
+
+def test_adversarial_state_round_trips_and_optimizer_holds_discriminator(tmp_path):
+    trainer = build_trainer(tmp_path)
+    discriminator = {id(p) for p in trainer.adversarial_module.parameters()}
+    assert discriminator <= {id(p) for g in trainer.optimizer.param_groups for p in g["params"]}
+    trainer.run()
+    resumed = build_trainer(tmp_path)
+    resumed.load_checkpoint()
+    for key, value in trainer.adversarial_module.state_dict().items():
+        assert torch.equal(resumed.adversarial_module.state_dict()[key], value)
+
+
+def test_adversarial_config_mismatch_fails_load(tmp_path):
+    trainer = build_trainer(tmp_path)
+    trainer.supervision = make_supervision(trainer.target_sample_ids)
+    trainer.save_checkpoint()
+    other = build_trainer(tmp_path)
+    other.adversarial_module.hidden_dim = 8
+    with pytest.raises(ValueError, match="adversarial configuration"):
+        other.load_checkpoint()
