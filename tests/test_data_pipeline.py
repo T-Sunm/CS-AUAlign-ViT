@@ -426,3 +426,18 @@ def test_raf_annotation_cannot_allow_expw_overlap(tmp_path):
     audit = runpy.run_path("scripts/audit_data.py")["audit"]
     with pytest.raises(ValueError, match="only to RAF-DB"):
         audit(output / "processed.jsonl", raf_annotation=tmp_path / "annotation")
+
+
+def test_drop_last_and_combined_source_loader(tmp_path):
+    import pytest
+
+    from cs_aualign_vit.data.datasets import build_loader, build_source_loader
+
+    output, *_ = prepared_fixture(tmp_path, "raf_db")
+    manifest = output / "processed.jsonl"
+    assert build_loader(manifest, "source_train", batch_size=2, drop_last=True).drop_last
+    for role in ("evaluation", "target_features"):
+        with pytest.raises(ValueError, match="must not drop"):
+            build_loader(manifest, role, batch_size=1, drop_last=True)
+    loader = build_source_loader([manifest, tmp_path / "missing.jsonl"], batch_size=1, drop_last=True)
+    assert loader.drop_last and len(loader.dataset) >= 1
