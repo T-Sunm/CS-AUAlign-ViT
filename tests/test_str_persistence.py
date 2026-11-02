@@ -34,6 +34,60 @@ def test_crash_mid_round_resumes_without_duplicates_and_keeps_class(tmp_path, mo
     assert len({r["target_id"] for r in rows}) == 3
 
 
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_completed_str_resume_rejects_invalid_png(tmp_path, damage):
+    resampler, model, banks = build(tmp_path, {0: 4, 1: 2}, [1, 1])
+    resampler.run(start(resampler, model, banks, tmp_path), model)
+    image = next(resampler.images_dir.glob("*.png"))
+    image.unlink() if damage == "missing" else image.write_bytes(b"invalid png")
+
+    with pytest.raises(ValueError, match="missing or corrupt"):
+        resampler.rebuild_source_loader(resampler.get_transaction(1))
+
+
+def test_completed_str_resume_rejects_missing_manifest(tmp_path):
+    resampler, model, banks = build(tmp_path, {0: 4, 1: 2}, [1])
+    resampler.run(start(resampler, model, banks, tmp_path), model)
+    resampler.manifest_path.unlink()
+
+    with pytest.raises(ValueError, match="class counts"):
+        resampler.rebuild_source_loader(resampler.get_transaction(1))
+
+
+@pytest.mark.parametrize(
+    ("key", "changed"),
+    [
+        ("global_seed", 11),
+        ("confidence_threshold", 0.9),
+        ("num_classes", 3),
+    ],
+)
+def test_str_resume_rejects_changed_config(tmp_path, key, changed):
+    resampler, model, banks = build(tmp_path, {0: 4, 1: 2}, [1, 1])
+    transaction = start(resampler, model, banks, tmp_path)
+    config = {
+        "global_seed": resampler.global_seed,
+        "confidence_threshold": resampler.confidence_threshold,
+        "num_classes": resampler.num_classes,
+    }
+    config[key] = changed
+    resumed = module.SelfTrainingResampler(
+        source_manifest=resampler.source_manifest,
+        target_feature_loader=resampler.target_feature_loader,
+        prototype_banks=banks,
+        output_dir=resampler.output_dir,
+        batch_size=resampler.batch_size,
+        device="cpu",
+        **config,
+    )
+
+    with pytest.raises(ValueError, match=key):
+        resumed.get_transaction(1)
+    with pytest.raises(ValueError, match=key):
+        resumed.run(transaction, model)
+
+
 def test_orphan_image_is_overwritten(tmp_path):
     resampler, model, banks = build(tmp_path, {0: 4, 1: 2}, [1])
     tx = start(resampler, model, banks, tmp_path)

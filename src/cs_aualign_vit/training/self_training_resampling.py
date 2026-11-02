@@ -76,6 +76,21 @@ class SelfTrainingResampler:
             rows.sort(key=lambda r: r["sample_id"])
 
     # -- persistence -----------------------------------------------------------------
+    def _transaction_config(self):
+        return {
+            "global_seed": self.global_seed,
+            "confidence_threshold": self.confidence_threshold,
+            "num_classes": self.num_classes,
+        }
+
+    def _validate_transaction_config(self, transaction):
+        for key, expected in self._transaction_config().items():
+            if transaction.get(key) != expected:
+                raise ValueError(
+                    f"STR transaction configuration mismatch for {key}: "
+                    f"saved={transaction.get(key)!r}, current={expected!r}"
+                )
+
     def _transaction_path(self, round_id):
         return self.transactions_dir / f"round-{round_id:02d}.json"
 
@@ -86,7 +101,9 @@ class SelfTrainingResampler:
         path = self._transaction_path(round_id)
         if not path.exists():
             return None
-        return json.loads(path.read_text())
+        transaction = json.loads(path.read_text())
+        self._validate_transaction_config(transaction)
+        return transaction
 
     def _counts(self, rows):
         counts = [len(self._donors[c]) for c in range(self.num_classes)]
@@ -106,7 +123,7 @@ class SelfTrainingResampler:
             "checkpoint_path": str(checkpoint_path),
             "status": "in_progress",
             "selected_class": selected,
-            "global_seed": self.global_seed,
+            **self._transaction_config(),
             "counts_before": counts,
         }
         write_json(self._transaction_path(round_id), transaction)
@@ -114,7 +131,16 @@ class SelfTrainingResampler:
 
     def _validate_manifest(self):
         rows = self._read_manifest()
+        used_target_ids = set()
         for row in rows:
+            target_id = row.get("target_id")
+            if not isinstance(target_id, str) or not target_id:
+                raise ValueError("STR record has invalid target_id")
+            if target_id in used_target_ids:
+                raise ValueError(f"STR manifest has duplicate target_id: {target_id}")
+            used_target_ids.add(target_id)
+            if type(row.get("round_id")) is not int or row["round_id"] < 1:
+                raise ValueError(f"STR record has invalid round_id: {row.get('round_id')}")
             if row.get("sample_id") != str_sample_id(row.get("round_id"), row.get("target_id")):
                 raise ValueError(f"STR record has inconsistent sample_id: {row.get('sample_id')}")
             path = (self.output_dir / row["processed_path"]).resolve()
@@ -130,11 +156,13 @@ class SelfTrainingResampler:
     # -- generation ------------------------------------------------------------------
     def _predict(self, model, banks):
         predictions = {}
+        observed_ids = []
         was_training = model.training
         try:
             model.eval()
             with torch.no_grad():
                 for images, sample_ids in self.target_feature_loader:
+                    observed_ids.extend(sample_ids)
                     features = model.forward_target_features(images.to(self.device)).float()
                     probabilities = F.softmax(banks.target_logits(features), dim=1)
                     confidence, labels = probabilities.max(dim=1)
@@ -144,6 +172,12 @@ class SelfTrainingResampler:
                         predictions[sid] = (label, c)
         finally:
             model.train(was_training)
+        expected_ids = [sample["sample_id"] for sample in self.target_dataset.samples]
+        if observed_ids != expected_ids:
+            raise ValueError(
+                "Target feature scan sample_ids differ from the full target dataset "
+                "(missing, duplicated, or out-of-order samples)"
+            )
         return predictions
 
     @staticmethod
@@ -152,6 +186,7 @@ class SelfTrainingResampler:
             return image.convert("RGB")
 
     def run(self, transaction, model):
+        self._validate_transaction_config(transaction)
         round_id, epoch = transaction["round_id"], transaction["epoch"]
         selected = transaction["selected_class"]
         state = torch.load(transaction["checkpoint_path"], map_location=self.device, weights_only=True)
@@ -169,7 +204,7 @@ class SelfTrainingResampler:
         gated = sorted(
             sid
             for sid, (label, confidence) in predictions.items()
-            if label == selected and confidence > self.confidence_threshold
+            if label == selected and confidence > transaction["confidence_threshold"]
         )
         candidates = [sid for sid in gated if sid not in used]
         rejects = dict.fromkeys(REJECT_REASONS, 0)
@@ -184,7 +219,7 @@ class SelfTrainingResampler:
                 rejects[reason] += 1
                 continue
             row = None
-            for donor in _donor_order(self._donors[selected], self.global_seed, round_id, target_id):
+            for donor in _donor_order(self._donors[selected], transaction["global_seed"], round_id, target_id):
                 donor_image = self._load_rgb(donor["_path"])
                 rois_s = compute_rois(donor["landmarks_crop"], donor_image.size)
                 if validate_rois(rois_s, donor_image.size) is not None:
@@ -248,8 +283,15 @@ class SelfTrainingResampler:
 
     def rebuild_source_loader(self, transaction):
         round_id = transaction["round_id"]
-        if any(row["round_id"] > round_id for row in self._read_manifest()):
+        rows = self._validate_manifest()
+        if any(row["round_id"] > round_id for row in rows):
             raise ValueError("STR manifest contains records from a later round")
+        if (
+            transaction.get("status") == "completed"
+            and "counts_after" in transaction
+            and self._counts(rows) != transaction["counts_after"]
+        ):
+            raise ValueError("STR manifest class counts differ from completed transaction")
         return build_source_loader(
             [self.source_manifest, self.manifest_path],
             batch_size=self.batch_size,

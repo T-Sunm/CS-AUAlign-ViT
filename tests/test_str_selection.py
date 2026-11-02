@@ -1,4 +1,5 @@
 
+import pytest
 from str_helpers import (
     TinyImageModel,
     feature_loader,
@@ -7,6 +8,7 @@ from str_helpers import (
     make_target,
     save_snapshot,
 )
+from torch.utils.data import DataLoader
 
 from cs_aualign_vit.data.manifests import read_jsonl
 from cs_aualign_vit.training import self_training_resampling as module
@@ -36,6 +38,30 @@ def start(resampler, model, banks, tmp_path, round_id=1, epoch=25):
     snapshot = tmp_path / f"snap{round_id}.pt"
     save_snapshot(snapshot, model, banks, epoch)
     return resampler.create_transaction(round_id=round_id, epoch=epoch, checkpoint_path=snapshot)
+
+
+
+@pytest.mark.parametrize(
+    "indices",
+    [[0, 1], [0, 0, 2], [2, 1, 0]],
+    ids=["missing", "duplicate", "out_of_order"],
+)
+def test_target_scan_rejects_missing_duplicate_or_reordered_samples(tmp_path, indices):
+    resampler, model, banks = build(tmp_path, {0: 4, 1: 2}, [1, 1, 1])
+    resampler.target_feature_loader = DataLoader(
+        resampler.target_dataset, batch_size=2, sampler=indices
+    )
+    with pytest.raises(ValueError, match="Target feature scan"):
+        resampler.run(start(resampler, model, banks, tmp_path), model)
+
+
+def test_target_scan_rejects_drop_last(tmp_path):
+    resampler, model, banks = build(tmp_path, {0: 4, 1: 2}, [1, 1, 1])
+    resampler.target_feature_loader = DataLoader(
+        resampler.target_dataset, batch_size=2, drop_last=True
+    )
+    with pytest.raises(ValueError, match="Target feature scan"):
+        resampler.run(start(resampler, model, banks, tmp_path), model)
 
 
 def test_minority_class_and_tie_break(tmp_path):
