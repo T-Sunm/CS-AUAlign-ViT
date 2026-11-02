@@ -377,5 +377,5 @@ class AdaptationTrainer:
         random.setstate(state["python_rng_state"])
         torch.set_rng_state(state["torch_rng_state"].cpu())
         if torch.cuda.is_available() and state["cuda_rng_state"] is not None:
-            torch.cuda.set_rng_state_all(state["cuda_rng_state"])
+            torch.cuda.set_rng_state_all([rng.cpu() for rng in state["cuda_rng_state"]])
         return state
