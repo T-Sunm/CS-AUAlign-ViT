@@ -110,12 +110,19 @@ def refresh_target_supervision(
     try:
         feature_model.eval()
         with torch.no_grad():
-            for images, sample_ids in loader:
+            for batch_index, (images, sample_ids) in enumerate(loader, start=1):
                 features = feature_model.forward_target_features(images.to(device))
                 if features.ndim != 2 or features.shape[1] != prototypes.shape[1]:
                     raise ValueError("Target features do not match target prototype dimension")
                 feature_batches.append(features.float())
                 observed_ids.extend(sample_ids)
+                if batch_index % 100 == 0:
+                    LOGGER.info(
+                        "target refresh epoch=%d: %d/%d samples",
+                        epoch,
+                        len(observed_ids),
+                        len(expected_sample_ids),
+                    )
     finally:
         feature_model.train(was_training)
 

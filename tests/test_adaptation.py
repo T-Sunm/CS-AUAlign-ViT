@@ -132,6 +132,52 @@ def test_training_run_uses_target_epoch_refreshes_and_round_trips_checkpoint(tmp
     assert resumed.run() == []
 
 
+def test_resume_restores_training_loader_shuffle_order(tmp_path):
+    trainer = build_trainer(tmp_path)
+    source = TensorDataset(torch.arange(8), torch.arange(8))
+    target = TargetDataset(torch.arange(8))
+    trainer.source_loader = DataLoader(
+        source,
+        batch_size=2,
+        shuffle=True,
+        drop_last=True,
+        generator=torch.Generator().manual_seed(11),
+    )
+    trainer.target_loader = DataLoader(
+        target,
+        batch_size=2,
+        shuffle=True,
+        drop_last=True,
+        generator=torch.Generator().manual_seed(22),
+    )
+    list(trainer.source_loader)
+    list(trainer.target_loader)
+    trainer.supervision = make_supervision(trainer.target_sample_ids)
+    trainer.save_checkpoint()
+    expected_source = [labels.tolist() for _, labels in trainer.source_loader]
+    expected_target = [list(sample_ids) for _, sample_ids in trainer.target_loader]
+
+    resumed = build_trainer(tmp_path)
+    resumed.source_loader = DataLoader(
+        source,
+        batch_size=2,
+        shuffle=True,
+        drop_last=True,
+        generator=torch.Generator().manual_seed(11),
+    )
+    resumed.target_loader = DataLoader(
+        target,
+        batch_size=2,
+        shuffle=True,
+        drop_last=True,
+        generator=torch.Generator().manual_seed(22),
+    )
+    resumed.load_checkpoint()
+
+    assert [labels.tolist() for _, labels in resumed.source_loader] == expected_source
+    assert [list(sample_ids) for _, sample_ids in resumed.target_loader] == expected_target
+
+
 def test_loss_is_assembled_once_with_baseline_weights(tmp_path):
     trainer = build_trainer(tmp_path)
     trainer.supervision = make_supervision(trainer.target_sample_ids)
@@ -300,12 +346,14 @@ def test_resume_after_completed_round_restores_str_images(tmp_path):
     trainer, *_ = build_real(tmp_path, config=config)
     trainer.run()
     assert len(trainer.source_loader.dataset) == 10
+    expected_generator_state = trainer.source_loader.generator.get_state()
 
     resumed, resampler, _ = build_real(tmp_path, config=config)
     resumed.load_checkpoint()
     assert len(resumed.source_loader.dataset) == 6  # fresh loader, before restore
     assert resumed.run() == []
     assert len(resumed.source_loader.dataset) == 10
+    assert torch.equal(resumed.source_loader.generator.get_state(), expected_generator_state)
     assert resampler.get_transaction(1)["status"] == "completed"
 
 
@@ -342,3 +390,10 @@ def test_snapshot_is_written_before_main_checkpoint(tmp_path, monkeypatch):
         trainer.run()
     assert trainer._boundary_checkpoint_path().exists()
     assert torch.load(trainer.checkpoint_path, weights_only=True)["completed_epoch"] == 1
+
+    resumed, resampler, _ = build_real(tmp_path, config=config)
+    resumed.load_checkpoint()
+    assert resumed.completed_epoch == 2
+    assert resumed.boundary_completed is False
+    assert resumed.run() == []
+    assert resampler.get_transaction(1)["status"] == "completed"

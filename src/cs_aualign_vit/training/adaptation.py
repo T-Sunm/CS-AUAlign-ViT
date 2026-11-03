@@ -1,7 +1,9 @@
 """End-to-end orchestration for POST adaptation."""
 
+import logging
 import os
 import random
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -15,7 +17,8 @@ from cs_aualign_vit.training.target_supervision import (
     refresh_target_supervision,
 )
 
-ADAPTATION_CHECKPOINT_VERSION = 2
+ADAPTATION_CHECKPOINT_VERSION = 3
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,7 @@ class AdaptationTrainer:
         self.global_step = 0
         self.boundary_completed = True
         self._source_restored = False
+        self._source_generator_state = None
 
         config = self.config
         if config.amp and (self.device.type != "cuda" or scaler is None):
@@ -203,7 +207,7 @@ class AdaptationTrainer:
             **getattr(self.adversarial_module, "last_metrics", {}),
         }
 
-    def train_epoch(self):
+    def train_epoch(self, *, progress=False):
         self.model.train()
         self.prototype_banks.train()
         self.adversarial_module.train()
@@ -220,24 +224,39 @@ class AdaptationTrainer:
             for name, value in metrics.items():
                 totals[name] = totals.get(name, 0.0) + value
             steps += 1
+            if progress:
+                completed = int(30 * steps / len(self.target_loader))
+                bar = "=" * completed + "." * (30 - completed)
+                sys.stdout.write(
+                    f"\rEpoch {self.completed_epoch + 1}/{self.config.max_epochs} "
+                    f"[{bar}] {steps}/{len(self.target_loader)} "
+                    f"loss={totals['loss_total'] / steps:.4f}"
+                )
+                sys.stdout.flush()
+        if progress:
+            sys.stdout.write("\n")
         return {name: value / steps for name, value in totals.items()} | {"steps": steps}
 
-    def run(self):
+    def run(self, on_epoch_end=None, *, progress=False):
         if self.supervision is None:
+            LOGGER.info("Refreshing target supervision at epoch 0")
             self.refresh_supervision(0)
         self._finish_pending_boundary()
         history = []
         for epoch in range(self.completed_epoch + 1, self.config.max_epochs + 1):
-            metrics = self.train_epoch()
+            metrics = self.train_epoch(progress=progress)
             self.scheduler.step()
             self.completed_epoch = epoch
             if epoch % self.config.kmeans_interval == 0 and epoch < self.config.max_epochs:
                 self.refresh_supervision(epoch)
             self.boundary_completed = epoch not in self.config.str_epochs
             self.save_checkpoint(boundary_snapshot=epoch in self.config.str_epochs)
+            row = {"epoch": epoch, **metrics}
+            history.append(row)
+            if on_epoch_end is not None:
+                on_epoch_end(row)
             if epoch in self.config.str_epochs:
                 self._finish_pending_boundary()
-            history.append({"epoch": epoch, **metrics})
         return history
 
     def _round_id(self, epoch):
@@ -248,6 +267,17 @@ class AdaptationTrainer:
         if transaction is None:
             return "absent"
         return transaction["status"] if isinstance(transaction, dict) else transaction.status
+
+    @staticmethod
+    def _loader_generator_state(loader):
+        generator = getattr(loader, "generator", None)
+        return generator.get_state() if generator is not None else None
+
+    @staticmethod
+    def _restore_loader_generator(loader, state):
+        generator = getattr(loader, "generator", None)
+        if generator is not None and state is not None:
+            generator.set_state(state.cpu())
 
     def _finish_pending_boundary(self):
         if self.completed_epoch == 0 or self.completed_epoch not in self.config.str_epochs:
@@ -289,18 +319,21 @@ class AdaptationTrainer:
 
     def _restore_source_loader(self):
         """After resume, rebuild the source loader from the latest completed STR round."""
-        if self._source_restored or self.str_service is None:
+        if self._source_restored:
             return
         self._source_restored = True
-        passed = [e for e in self.config.str_epochs if e <= self.completed_epoch]
-        for epoch in reversed(passed):
-            transaction = self.str_service.get_transaction(self._round_id(epoch))
-            if self._transaction_status(transaction) == "completed":
-                self.source_loader = self.str_service.rebuild_source_loader(
-                    transaction, source_transform=self.source_transform
-                )
-                self._validate_loader(self.source_loader, "source")
-                return
+        if self.str_service is not None:
+            passed = [e for e in self.config.str_epochs if e <= self.completed_epoch]
+            for epoch in reversed(passed):
+                transaction = self.str_service.get_transaction(self._round_id(epoch))
+                if self._transaction_status(transaction) == "completed":
+                    self.source_loader = self.str_service.rebuild_source_loader(
+                        transaction, source_transform=self.source_transform
+                    )
+                    self._validate_loader(self.source_loader, "source")
+                    break
+        self._restore_loader_generator(self.source_loader, self._source_generator_state)
+        self._source_generator_state = None
 
     def state_dict(self):
         if self.supervision is None:
@@ -331,6 +364,8 @@ class AdaptationTrainer:
             "python_rng_state": random.getstate(),
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "source_loader_generator_state": self._loader_generator_state(self.source_loader),
+            "target_loader_generator_state": self._loader_generator_state(self.target_loader),
         }
 
     def _boundary_checkpoint_path(self):
@@ -356,7 +391,16 @@ class AdaptationTrainer:
         self._atomic_save(state, self.checkpoint_path)
 
     def load_checkpoint(self):
-        state = torch.load(self.checkpoint_path, map_location=self.device, weights_only=True)
+        paths = [self.checkpoint_path] if self.checkpoint_path.exists() else []
+        paths.extend(
+            self.checkpoint_path.parent.glob(
+                f"{self.checkpoint_path.stem}.epoch-*.boundary{self.checkpoint_path.suffix}"
+            )
+        )
+        if not paths:
+            raise FileNotFoundError(f"No adaptation checkpoint found for {self.checkpoint_path}")
+        states = [torch.load(path, map_location=self.device, weights_only=True) for path in paths]
+        state = max(states, key=lambda candidate: candidate.get("completed_epoch", -1))
         if state.get("schema_version") != ADAPTATION_CHECKPOINT_VERSION:
             raise ValueError("Unsupported adaptation checkpoint schema")
         if state.get("target_sample_ids") != self.target_sample_ids:
@@ -383,6 +427,13 @@ class AdaptationTrainer:
         self.global_step = state["global_step"]
         self.boundary_completed = state["boundary_completed"]
         self._source_restored = False
+        self._source_generator_state = (
+            state["source_loader_generator_state"] if self.boundary_completed else None
+        )
+        self._restore_loader_generator(self.source_loader, self._source_generator_state)
+        self._restore_loader_generator(
+            self.target_loader, state["target_loader_generator_state"]
+        )
         random.setstate(state["python_rng_state"])
         torch.set_rng_state(state["torch_rng_state"].cpu())
         if torch.cuda.is_available() and state["cuda_rng_state"] is not None:
