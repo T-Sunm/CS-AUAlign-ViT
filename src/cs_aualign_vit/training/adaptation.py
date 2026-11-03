@@ -80,6 +80,7 @@ class AdaptationTrainer:
         self.completed_epoch = 0
         self.global_step = 0
         self.boundary_completed = True
+        self._source_restored = False
 
         config = self.config
         if config.amp and (self.device.type != "cuda" or scaler is None):
@@ -246,6 +247,7 @@ class AdaptationTrainer:
     def _finish_pending_boundary(self):
         if self.completed_epoch == 0 or self.completed_epoch not in self.config.str_epochs:
             self.boundary_completed = True
+            self._restore_source_loader()
             return
         round_id = self._round_id(self.completed_epoch)
         transaction = self.str_service.get_transaction(round_id)
@@ -257,6 +259,7 @@ class AdaptationTrainer:
                     f"epoch={self.completed_epoch}, expected_round_id={round_id}, "
                     f"boundary=completed, transaction={status}"
                 )
+            self._restore_source_loader()
             return
         if status == "absent":
             transaction = self.str_service.create_transaction(
@@ -276,6 +279,19 @@ class AdaptationTrainer:
         self._validate_loader(self.source_loader, "source")
         self.boundary_completed = True
         self.save_checkpoint()
+
+    def _restore_source_loader(self):
+        """After resume, rebuild the source loader from the latest completed STR round."""
+        if self._source_restored or self.str_service is None:
+            return
+        self._source_restored = True
+        passed = [e for e in self.config.str_epochs if e <= self.completed_epoch]
+        for epoch in reversed(passed):
+            transaction = self.str_service.get_transaction(self._round_id(epoch))
+            if self._transaction_status(transaction) == "completed":
+                self.source_loader = self.str_service.rebuild_source_loader(transaction)
+                self._validate_loader(self.source_loader, "source")
+                return
 
     def state_dict(self):
         if self.supervision is None:
@@ -325,9 +341,10 @@ class AdaptationTrainer:
     def save_checkpoint(self, *, boundary_snapshot=False):
         self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         state = self.state_dict()
-        self._atomic_save(state, self.checkpoint_path)
         if boundary_snapshot:
+            # Snapshot first: a crash in between must never leave a transaction without it.
             self._atomic_save(state, self._boundary_checkpoint_path())
+        self._atomic_save(state, self.checkpoint_path)
 
     def load_checkpoint(self):
         state = torch.load(self.checkpoint_path, map_location=self.device, weights_only=True)
@@ -356,6 +373,7 @@ class AdaptationTrainer:
         self.completed_epoch = state["completed_epoch"]
         self.global_step = state["global_step"]
         self.boundary_completed = state["boundary_completed"]
+        self._source_restored = False
         random.setstate(state["python_rng_state"])
         torch.set_rng_state(state["torch_rng_state"].cpu())
         if torch.cuda.is_available() and state["cuda_rng_state"] is not None:

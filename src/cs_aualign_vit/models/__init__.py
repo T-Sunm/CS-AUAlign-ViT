@@ -7,8 +7,8 @@ from .source_pretraining import SourcePrototypeClassifier, build_swin_t, copy_ta
 
 __all__ = [
     "AdversarialAlignment",
-    "DomainDiscriminator",
     "BCSFeatures",
+    "DomainDiscriminator",
     "POSTBCSModel",
     "PrototypeBanks",
     "SourcePrototypeClassifier",

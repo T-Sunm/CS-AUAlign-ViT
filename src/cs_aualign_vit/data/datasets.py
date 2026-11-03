@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from .manifests import read_jsonl, validate_rows
 from .transforms import build_transform
@@ -88,11 +88,14 @@ def build_loader(
     image_size=224,
     mean=(0.485, 0.456, 0.406),
     std=(0.229, 0.224, 0.225),
+    drop_last=False,
 ):
     import torch
 
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if drop_last and role in {"evaluation", "target_features"}:
+        raise ValueError(f"{role} loaders must not drop samples")
     dataset = FaceDataset(
         manifest,
         role,
@@ -107,6 +110,45 @@ def build_loader(
         num_workers=num_workers,
         generator=generator,
         worker_init_fn=_seed_worker,
+        drop_last=drop_last,
+    )
+
+
+def build_source_loader(
+    manifests,
+    *,
+    batch_size,
+    drop_last,
+    seed=0,
+    num_workers=0,
+    image_size=224,
+    mean=(0.485, 0.456, 0.406),
+    std=(0.229, 0.224, 0.225),
+):
+    """Shuffled source loader over the original manifest plus any non-empty STR manifests.
+
+    The first manifest is mandatory; later ones (STR rounds) are skipped when absent or empty.
+    """
+    import torch
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    manifests = [Path(m) for m in manifests]
+    if not manifests:
+        raise ValueError("At least the original source manifest is required")
+    transform = build_transform(True, image_size, mean, std)
+    datasets = [FaceDataset(manifests[0], "source_train", transform=transform)]
+    for extra in manifests[1:]:
+        if extra.exists() and extra.stat().st_size and read_jsonl(extra):
+            datasets.append(FaceDataset(extra, "source_train", transform=transform))
+    return DataLoader(
+        ConcatDataset(datasets),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        generator=torch.Generator().manual_seed(seed),
+        worker_init_fn=_seed_worker,
+        drop_last=drop_last,
     )
 
 
