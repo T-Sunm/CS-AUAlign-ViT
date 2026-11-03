@@ -56,7 +56,7 @@ class FakeSTR:
         transaction["status"] = "completed"
         return transaction
 
-    def rebuild_source_loader(self, _transaction):
+    def rebuild_source_loader(self, _transaction, *, source_transform=None):
         self.rebuilds += 1
         return self.source_loader
 
@@ -223,7 +223,7 @@ def test_adversarial_config_mismatch_fails_load(tmp_path):
 
 
 # ---- real STR resampler on a small image fixture -------------------------------------
-def build_real(tmp_path, *, config, target_colors=(1, 1, 1, 1)):
+def build_real(tmp_path, *, config, target_colors=(1, 1, 1, 1), source_image_size=224):
     from str_helpers import TinyImageModel, make_banks, make_source, make_target
 
     from cs_aualign_vit.data.datasets import FaceDataset, build_loader, build_source_loader
@@ -254,7 +254,9 @@ def build_real(tmp_path, *, config, target_colors=(1, 1, 1, 1)):
         adversarial_module=adversary,
         optimizer=optimizer,
         scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.max_epochs),
-        source_loader=build_source_loader([source], batch_size=2, drop_last=True, seed=3),
+        source_loader=build_source_loader(
+            [source], batch_size=2, drop_last=True, seed=3, image_size=source_image_size
+        ),
         target_loader=build_loader(target, "target_adaptation", batch_size=2, drop_last=True),
         target_feature_loader=feature_loader,
         target_sample_ids=[s["sample_id"] for s in FaceDataset(target, "target_features").samples],
@@ -305,6 +307,24 @@ def test_resume_after_completed_round_restores_str_images(tmp_path):
     assert resumed.run() == []
     assert len(resumed.source_loader.dataset) == 10
     assert resampler.get_transaction(1)["status"] == "completed"
+
+
+def test_str_rebuild_keeps_source_training_transform(tmp_path):
+    config = AdaptationConfig(max_epochs=2, kmeans_interval=1, str_epochs=(1,), num_classes=2)
+    trainer, _, _ = build_real(tmp_path, config=config, source_image_size=32)
+    original_transform = trainer.source_loader.dataset.datasets[0].transform
+
+    trainer.run()
+
+    assert all(
+        dataset.transform is original_transform for dataset in trainer.source_loader.dataset.datasets
+    )
+    assert trainer.source_loader.dataset[0][0].shape == (3, 32, 32)
+
+    resumed, _, _ = build_real(tmp_path, config=config, source_image_size=32)
+    resumed.load_checkpoint()
+    resumed.run()
+    assert resumed.source_loader.dataset[0][0].shape == (3, 32, 32)
 
 
 def test_snapshot_is_written_before_main_checkpoint(tmp_path, monkeypatch):

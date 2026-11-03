@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
+from torch.utils.data import ConcatDataset
 
 from cs_aualign_vit.data.manifests import CLASSES
 from cs_aualign_vit.training.prototype_learning import compute_prototype_losses
@@ -66,6 +67,10 @@ class AdaptationTrainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.source_loader = source_loader
+        source_dataset = source_loader.dataset
+        if isinstance(source_dataset, ConcatDataset):
+            source_dataset = source_dataset.datasets[0]
+        self.source_transform = getattr(source_dataset, "transform", None)
         self.target_loader = target_loader
         self.target_feature_loader = target_feature_loader
         self.target_sample_ids = list(target_sample_ids)
@@ -275,7 +280,9 @@ class AdaptationTrainer:
             raise RuntimeError(
                 f"STR round {round_id} for epoch {self.completed_epoch} did not complete"
             )
-        self.source_loader = self.str_service.rebuild_source_loader(transaction)
+        self.source_loader = self.str_service.rebuild_source_loader(
+            transaction, source_transform=self.source_transform
+        )
         self._validate_loader(self.source_loader, "source")
         self.boundary_completed = True
         self.save_checkpoint()
@@ -289,7 +296,9 @@ class AdaptationTrainer:
         for epoch in reversed(passed):
             transaction = self.str_service.get_transaction(self._round_id(epoch))
             if self._transaction_status(transaction) == "completed":
-                self.source_loader = self.str_service.rebuild_source_loader(transaction)
+                self.source_loader = self.str_service.rebuild_source_loader(
+                    transaction, source_transform=self.source_transform
+                )
                 self._validate_loader(self.source_loader, "source")
                 return
 

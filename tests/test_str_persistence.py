@@ -32,6 +32,7 @@ def test_crash_mid_round_resumes_without_duplicates_and_keeps_class(tmp_path, mo
     assert done["selected_class"] == 1 and done["status"] == "completed"
     assert len(rows) == len({r["sample_id"] for r in rows}) == 3
     assert len({r["target_id"] for r in rows}) == 3
+    assert done["created"] == 3
 
 
 

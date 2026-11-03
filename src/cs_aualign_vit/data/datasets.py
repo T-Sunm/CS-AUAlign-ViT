@@ -124,6 +124,7 @@ def build_source_loader(
     image_size=224,
     mean=(0.485, 0.456, 0.406),
     std=(0.229, 0.224, 0.225),
+    transform=None,
 ):
     """Shuffled source loader over the original manifest plus any non-empty STR manifests.
 
@@ -136,7 +137,7 @@ def build_source_loader(
     manifests = [Path(m) for m in manifests]
     if not manifests:
         raise ValueError("At least the original source manifest is required")
-    transform = build_transform(True, image_size, mean, std)
+    transform = transform or build_transform(True, image_size, mean, std)
     datasets = [FaceDataset(manifests[0], "source_train", transform=transform)]
     for extra in manifests[1:]:
         if extra.exists() and extra.stat().st_size and read_jsonl(extra):

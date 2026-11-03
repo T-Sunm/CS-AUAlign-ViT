@@ -208,7 +208,6 @@ class SelfTrainingResampler:
         )
         candidates = [sid for sid in gated if sid not in used]
         rejects = dict.fromkeys(REJECT_REASONS, 0)
-        created = 0
         self.images_dir.mkdir(parents=True, exist_ok=True)
         for target_id in candidates:
             meta = self.target_dataset.metadata(target_id)
@@ -232,7 +231,7 @@ class SelfTrainingResampler:
                 rejects["no_valid_donor"] += 1
             else:
                 rows.append(row)
-                created += 1
+        created = sum(row["round_id"] == round_id for row in rows)
         counts_after = self._counts(rows)
         completed = {
             **transaction,
@@ -281,7 +280,7 @@ class SelfTrainingResampler:
         write_jsonl(self.manifest_path, [*rows, row])
         return row
 
-    def rebuild_source_loader(self, transaction):
+    def rebuild_source_loader(self, transaction, *, source_transform=None):
         round_id = transaction["round_id"]
         rows = self._validate_manifest()
         if any(row["round_id"] > round_id for row in rows):
@@ -298,4 +297,5 @@ class SelfTrainingResampler:
             drop_last=True,
             seed=self.global_seed + round_id,
             num_workers=self.num_workers,
+            transform=source_transform,
         )
