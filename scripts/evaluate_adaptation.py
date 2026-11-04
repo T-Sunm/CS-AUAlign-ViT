@@ -1,4 +1,4 @@
-"""Evaluate a completed POST adaptation checkpoint on ExpW validation or test."""
+"""Evaluate a completed POST adaptation epoch checkpoint on ExpW validation or test."""
 
 import argparse
 import json
@@ -35,8 +35,6 @@ def run(args):
         raise ValueError("Unsupported adaptation checkpoint schema")
     if not state.get("boundary_completed"):
         raise ValueError("Evaluation requires a completed adaptation boundary")
-    if state.get("completed_epoch") != state.get("config", {}).get("max_epochs"):
-        raise ValueError("Evaluation requires the final adaptation checkpoint")
     if state.get("class_mapping") != list(CLASSES):
         raise ValueError("Adaptation checkpoint class mapping differs from the data pipeline")
     source_checkpoint = args.source_checkpoint or state.get("source_checkpoint")

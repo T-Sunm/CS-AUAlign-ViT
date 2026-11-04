@@ -251,12 +251,12 @@ class AdaptationTrainer:
                 self.refresh_supervision(epoch)
             self.boundary_completed = epoch not in self.config.str_epochs
             self.save_checkpoint(boundary_snapshot=epoch in self.config.str_epochs)
+            if epoch in self.config.str_epochs:
+                self._finish_pending_boundary()
             row = {"epoch": epoch, **metrics}
             history.append(row)
             if on_epoch_end is not None:
                 on_epoch_end(row)
-            if epoch in self.config.str_epochs:
-                self._finish_pending_boundary()
         return history
 
     def _round_id(self, epoch):

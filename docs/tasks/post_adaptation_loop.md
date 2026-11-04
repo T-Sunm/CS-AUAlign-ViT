@@ -819,10 +819,10 @@ Target ground truth không được dùng cho:
 - trusted-set selection;
 - STR;
 - optimizer decisions;
-- checkpoint selection;
 - stopping decisions.
 
-Target evaluation thuộc Task 7.
+ExpW validation chỉ dùng để đo accuracy sau mỗi epoch và chọn `best.pt`;
+không đi vào optimizer, pseudo-label hoặc STR. ExpW test dành cho evaluation cuối.
 
 Baseline reproduction chạy đủ 256 epochs, không early stop dựa trên target accuracy.
 
@@ -834,7 +834,9 @@ Sau STR round cuối ở epoch 250, epochs:
 
 tiếp tục train với cumulative source dataset hiện tại.
 
-Final adaptation checkpoint sau epoch 256 được chuyển cho Task 7.
+Final adaptation checkpoint sau epoch 256 và `best.pt` đều có thể được Task 7
+đánh giá. Checkpoint `best.pt` chỉ được lưu sau khi STR boundary của epoch đó
+hoàn tất.
 
 ---
 
