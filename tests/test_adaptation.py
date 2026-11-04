@@ -132,6 +132,19 @@ def test_training_run_uses_target_epoch_refreshes_and_round_trips_checkpoint(tmp
     assert resumed.run() == []
 
 
+def test_resume_keeps_target_supervision_on_cpu_for_cuda_training(tmp_path):
+    trainer = build_trainer(tmp_path)
+    trainer.supervision = make_supervision(trainer.target_sample_ids)
+    trainer.save_checkpoint()
+
+    resumed = build_trainer(tmp_path)
+    resumed.device = torch.device("cuda:0")
+    resumed.load_checkpoint()
+
+    assert resumed.supervision.pseudo_labels.device.type == "cpu"
+    assert resumed.supervision.trusted_mask.device.type == "cpu"
+
+
 def test_resume_restores_training_loader_shuffle_order(tmp_path):
     trainer = build_trainer(tmp_path)
     source = TensorDataset(torch.arange(8), torch.arange(8))

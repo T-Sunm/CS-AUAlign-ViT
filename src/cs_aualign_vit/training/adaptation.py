@@ -399,7 +399,7 @@ class AdaptationTrainer:
         )
         if not paths:
             raise FileNotFoundError(f"No adaptation checkpoint found for {self.checkpoint_path}")
-        states = [torch.load(path, map_location=self.device, weights_only=True) for path in paths]
+        states = [torch.load(path, map_location="cpu", weights_only=True) for path in paths]
         state = max(states, key=lambda candidate: candidate.get("completed_epoch", -1))
         if state.get("schema_version") != ADAPTATION_CHECKPOINT_VERSION:
             raise ValueError("Unsupported adaptation checkpoint schema")
