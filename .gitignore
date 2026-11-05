@@ -215,6 +215,8 @@ tempCodeRunnerFile.py
 # Local datasets and training outputs
 data/processed/
 runs/
+tmp/
+notebooks/tmp/
 
 # Marimo
 marimo/_static/
