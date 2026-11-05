@@ -5,12 +5,13 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
+from .au_guidance import AUCache, build_au_mask
 from .manifests import read_jsonl, validate_rows
-from .transforms import build_transform
+from .transforms import GuidanceTransform, build_transform
 
 
 class FaceDataset(Dataset):
-    def __init__(self, manifest, role, split=None, transform=None):
+    def __init__(self, manifest, role, split=None, transform=None, au_cache=None):
         allowed = {"source_train", "target_adaptation", "target_features", "evaluation"}
         if role not in allowed:
             raise ValueError(f"role must be one of {sorted(allowed)}")
@@ -35,6 +36,7 @@ class FaceDataset(Dataset):
             if split not in {"validation", "test"}:
                 raise ValueError("Evaluation requires validation/test")
         self.role = role
+        self.au_cache = au_cache
         self.transform = transform or build_transform(role in {"source_train", "target_adaptation"})
         self.samples = []
         for row in rows:
@@ -63,12 +65,26 @@ class FaceDataset(Dataset):
     def __getitem__(self, index):
         record = self.samples[index]
         with Image.open(record["processed_path"]) as image:
-            tensor = self.transform(image.convert("RGB"))
-        return tensor, (
+            image = image.convert("RGB")
+            if self.au_cache is None:
+                tensor = self.transform(image)
+                guidance = None
+            else:
+                mask, landmark_valid = build_au_mask(record["landmarks_crop"], image.size)
+                tensor, mask = self.transform(image, mask)
+                au, au_valid = self.au_cache.get(record["sample_id"])
+                guidance = {
+                    "au": au,
+                    "mask": mask,
+                    "au_valid": au_valid,
+                    "landmark_valid": landmark_valid,
+                }
+        identity = (
             record["sample_id"]
             if self.role in {"target_adaptation", "target_features"}
             else record["label"]
         )
+        return (tensor, identity) if guidance is None else (tensor, identity, guidance)
 
     def metadata(self, sample_id):
         """STR accesses stored coordinates; adaptation metadata contains no labels."""
@@ -89,6 +105,7 @@ def build_loader(
     mean=(0.485, 0.456, 0.406),
     std=(0.229, 0.224, 0.225),
     drop_last=False,
+    au_cache=None,
 ):
     import torch
 
@@ -96,11 +113,24 @@ def build_loader(
         raise ValueError("batch_size must be positive")
     if drop_last and role in {"evaluation", "target_features"}:
         raise ValueError(f"{role} loaders must not drop samples")
+    cache = (
+        AUCache(au_cache)
+        if au_cache is not None and not isinstance(au_cache, AUCache)
+        else au_cache
+    )
+    if cache is not None and role not in {"source_train", "target_adaptation"}:
+        raise ValueError("AU cache is only supported by paired training loaders")
+    transform = (
+        GuidanceTransform(image_size, mean, std)
+        if cache is not None and role in {"source_train", "target_adaptation"}
+        else build_transform(role in {"source_train", "target_adaptation"}, image_size, mean, std)
+    )
     dataset = FaceDataset(
         manifest,
         role,
         split,
-        build_transform(role in {"source_train", "target_adaptation"}, image_size, mean, std),
+        transform,
+        cache,
     )
     generator = torch.Generator().manual_seed(seed)
     return DataLoader(
@@ -125,6 +155,7 @@ def build_source_loader(
     mean=(0.485, 0.456, 0.406),
     std=(0.229, 0.224, 0.225),
     transform=None,
+    au_cache=None,
 ):
     """Shuffled source loader over the original manifest plus any non-empty STR manifests.
 
@@ -137,11 +168,20 @@ def build_source_loader(
     manifests = [Path(m) for m in manifests]
     if not manifests:
         raise ValueError("At least the original source manifest is required")
-    transform = transform or build_transform(True, image_size, mean, std)
-    datasets = [FaceDataset(manifests[0], "source_train", transform=transform)]
+    cache = (
+        AUCache(au_cache)
+        if au_cache is not None and not isinstance(au_cache, AUCache)
+        else au_cache
+    )
+    transform = transform or (
+        GuidanceTransform(image_size, mean, std)
+        if cache is not None
+        else build_transform(True, image_size, mean, std)
+    )
+    datasets = [FaceDataset(manifests[0], "source_train", transform=transform, au_cache=cache)]
     for extra in manifests[1:]:
         if extra.exists() and extra.stat().st_size and read_jsonl(extra):
-            datasets.append(FaceDataset(extra, "source_train", transform=transform))
+            datasets.append(FaceDataset(extra, "source_train", transform=transform, au_cache=cache))
     return DataLoader(
         ConcatDataset(datasets),
         batch_size=batch_size,

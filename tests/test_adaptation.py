@@ -26,13 +26,46 @@ class TinyBCS(nn.Module):
         super().__init__()
         self.projection = nn.Linear(2, 2, bias=False)
 
-    def forward_features(self, source, target):
+    def forward_features(self, source, target, guidance=None):
+        self.last_guidance = guidance
         source = self.projection(source)
         target = self.projection(target)
         return BCSFeatures(source, target, source + target, source - target)
 
     def forward_target_features(self, target):
         return self.projection(target)
+
+
+class AlignedTinyBCS(TinyBCS):
+    def forward_features(self, source, target, guidance=None):
+        features = super().forward_features(source, target, guidance)
+        return BCSFeatures(
+            features.source_features,
+            features.target_features,
+            features.target_to_source_features,
+            features.source_to_target_features,
+            features.source_features[:, None].expand(-1, 49, -1),
+            features.target_features[:, None].expand(-1, 49, -1),
+        )
+
+
+class GuidedDataset(Dataset):
+    def __init__(self, *, target=False):
+        self.target = target
+        self.sample_ids = [f"target:{index}" for index in range(2)]
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, index):
+        metadata = {
+            "au": torch.full((12,), 0.25 + 0.5 * index),
+            "mask": torch.ones(49, 12),
+            "au_valid": True,
+            "landmark_valid": True,
+        }
+        identity = self.sample_ids[index] if self.target else 0
+        return torch.tensor([1.0, float(index)]), identity, metadata
 
 
 class FakeSTR:
@@ -204,6 +237,101 @@ def test_loss_is_assembled_once_with_baseline_weights(tmp_path):
     assert all(p.grad is not None for p in trainer.adversarial_module.parameters())
     for key in ("acc_s", "acc_t", "acc_balanced"):
         assert key in metrics
+
+
+def test_dynamic_shuffled_builds_guidance_from_paired_metadata(tmp_path):
+    source = GuidedDataset()
+    target = GuidedDataset(target=True)
+    source_loader = DataLoader(source, batch_size=2, drop_last=True)
+    target_loader = DataLoader(target, batch_size=2, drop_last=True)
+    model = TinyBCS()
+    banks = PrototypeBanks(torch.eye(2))
+    adversary = AdversarialAlignment(input_dim=2, hidden_dim=4, dropout=0.0)
+    optimizer = torch.optim.SGD(
+        [*model.parameters(), *banks.parameters(), *adversary.parameters()], lr=0.01
+    )
+    source_cache, target_cache = tmp_path / "source.csv", tmp_path / "target.csv"
+    source_cache.write_text("source")
+    target_cache.write_text("target")
+    trainer = AdaptationTrainer(
+        model=model,
+        prototype_banks=banks,
+        adversarial_module=adversary,
+        optimizer=optimizer,
+        scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1),
+        source_loader=source_loader,
+        target_loader=target_loader,
+        target_feature_loader=DataLoader(TargetDataset(torch.ones(2, 2)), batch_size=2),
+        target_sample_ids=target.sample_ids,
+        device="cpu",
+        checkpoint_path=tmp_path / "guided.pt",
+        config=AdaptationConfig(
+            max_epochs=1,
+            kmeans_interval=1,
+            str_epochs=(),
+            num_classes=2,
+            au_mode="dynamic_shuffled",
+        ),
+        source_au_cache=source_cache,
+        target_au_cache=target_cache,
+    )
+    trainer.supervision = make_supervision(target.sample_ids)
+
+    metrics = trainer.train_step(next(iter(source_loader)), next(iter(target_loader)))
+
+    assert model.last_guidance.shape == (2, 49, 49)
+    assert metrics["au_nonzero_pair_ratio"] == 1
+    assert metrics["au_shuffled_ratio"] in {0, 0.5, 1}
+
+
+def test_alignment_runs_with_attention_off_and_logs_local_metrics(tmp_path):
+    source = GuidedDataset()
+    target = GuidedDataset(target=True)
+    source_loader = DataLoader(source, batch_size=2, drop_last=True)
+    target_loader = DataLoader(target, batch_size=2, drop_last=True)
+    model = AlignedTinyBCS()
+    banks = PrototypeBanks(torch.eye(2))
+    adversary = AdversarialAlignment(input_dim=2, hidden_dim=4, dropout=0.0)
+    optimizer = torch.optim.SGD(
+        [*model.parameters(), *banks.parameters(), *adversary.parameters()], lr=0.01
+    )
+    source_cache, target_cache = tmp_path / "source.csv", tmp_path / "target.csv"
+    source_cache.write_text("source")
+    target_cache.write_text("target")
+    trainer = AdaptationTrainer(
+        model=model,
+        prototype_banks=banks,
+        adversarial_module=adversary,
+        optimizer=optimizer,
+        scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1),
+        source_loader=source_loader,
+        target_loader=target_loader,
+        target_feature_loader=DataLoader(TargetDataset(torch.ones(2, 2)), batch_size=2),
+        target_sample_ids=target.sample_ids,
+        device="cpu",
+        checkpoint_path=tmp_path / "aligned.pt",
+        config=AdaptationConfig(
+            max_epochs=1,
+            kmeans_interval=1,
+            str_epochs=(),
+            num_classes=2,
+            au_alignment_enabled=True,
+            au_alignment_tau_mask=1.0,
+            au_alignment_n_eff_min=1.0,
+            au_alignment_q_c=(1.0,) * 12,
+            au_alignment_eta=0.1,
+        ),
+        source_au_cache=source_cache,
+        target_au_cache=target_cache,
+    )
+    trainer.supervision = make_supervision(target.sample_ids)
+
+    metrics = trainer.train_step(next(iter(source_loader)), next(iter(target_loader)))
+
+    assert model.last_guidance is None
+    assert metrics["loss_local"] >= 0
+    assert metrics["loss_local_weighted"] == pytest.approx(0.1 * metrics["loss_local"])
+    assert metrics["au_alignment_valid_count"] == 12
 
 
 def test_empty_paired_loader_fails_with_actionable_context(tmp_path):

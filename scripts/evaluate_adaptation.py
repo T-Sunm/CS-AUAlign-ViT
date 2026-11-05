@@ -46,7 +46,17 @@ def run(args):
         raise ValueError("Source checkpoint is missing preprocessing configuration")
     if not isinstance(preprocessing, dict):
         raise TypeError("Source checkpoint preprocessing configuration must be a dictionary")
-    model = POSTBCSModel.from_source_checkpoint(source_checkpoint).to(device)
+    adaptation_config = state.get("config", {})
+    au_mode = adaptation_config.get("au_mode", "off")
+    model = (
+        POSTBCSModel.from_source_checkpoint(source_checkpoint)
+        if au_mode == "off"
+        else POSTBCSModel.from_source_checkpoint(
+            source_checkpoint,
+            au_mode=au_mode,
+            g_scale=adaptation_config.get("au_g_scale", 1.0),
+        )
+    ).to(device)
     prototype_banks = PrototypeBanks.from_source_checkpoint(
         source_checkpoint, feature_dim=model.feature_dim
     ).to(device)

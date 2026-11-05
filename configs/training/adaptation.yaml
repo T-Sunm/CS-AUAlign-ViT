@@ -20,6 +20,19 @@ adversarial:
   lambda_grl: 1.0
 str:
   confidence_threshold: 0.95
+au_guidance:
+  mode: off
+  g_scale: 1.0
+  lambda_learning_rate: 0.01
+au_alignment:
+  enabled: false
+  tau_mask: null
+  n_eff_min: null
+  q_c: null
+  epsilon: 1.0e-8
+  epsilon_weight: 1.0e-8
+  r_target: 0.1
+  eta: null
 preprocessing:
   image_size: 224
   mean: [0.485, 0.456, 0.406]

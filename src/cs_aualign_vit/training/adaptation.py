@@ -1,6 +1,7 @@
 """End-to-end orchestration for POST adaptation."""
 
 import logging
+import math
 import os
 import random
 import sys
@@ -10,7 +11,9 @@ from pathlib import Path
 import torch
 from torch.utils.data import ConcatDataset
 
-from cs_aualign_vit.data.manifests import CLASSES
+from cs_aualign_vit.data.au_guidance import compute_guidance, shuffle_valid_au
+from cs_aualign_vit.data.manifests import CLASSES, sha256
+from cs_aualign_vit.training.au_alignment import compute_au_alignment
 from cs_aualign_vit.training.prototype_learning import compute_prototype_losses
 from cs_aualign_vit.training.target_supervision import (
     TargetSupervision,
@@ -31,6 +34,17 @@ class AdaptationConfig:
     gamma: float = 0.1
     amp: bool = False
     num_classes: int = 7
+    au_mode: str = "off"
+    au_g_scale: float = 1.0
+    au_lambda_learning_rate: float = 0.01
+    au_alignment_enabled: bool = False
+    au_alignment_tau_mask: float | None = None
+    au_alignment_n_eff_min: float | None = None
+    au_alignment_q_c: tuple[float, ...] | None = None
+    au_alignment_epsilon: float = 1.0e-8
+    au_alignment_epsilon_weight: float = 1.0e-8
+    au_alignment_r_target: float = 0.1
+    au_alignment_eta: float | None = None
 
     def __post_init__(self):
         if self.max_epochs < 1 or self.kmeans_interval < 1 or self.num_classes < 1:
@@ -39,6 +53,30 @@ class AdaptationConfig:
             raise ValueError("STR epochs must be inside the adaptation horizon")
         if tuple(sorted(set(self.str_epochs))) != self.str_epochs:
             raise ValueError("STR epochs must be unique and sorted")
+        if self.au_mode not in {"off", "dynamic", "dynamic_shuffled"}:
+            raise ValueError("au_mode must be off, dynamic, or dynamic_shuffled")
+        if self.au_g_scale <= 0 or self.au_lambda_learning_rate <= 0:
+            raise ValueError("AU scale and lambda learning rate must be positive")
+        if type(self.au_alignment_enabled) is not bool:
+            raise ValueError("au_alignment_enabled must be boolean")
+        if self.au_alignment_epsilon <= 0 or self.au_alignment_epsilon_weight < 0:
+            raise ValueError("AU alignment epsilons are invalid")
+        if self.au_alignment_r_target <= 0:
+            raise ValueError("AU alignment r_target must be positive")
+        if self.au_alignment_enabled:
+            values = (
+                self.au_alignment_tau_mask,
+                self.au_alignment_n_eff_min,
+                self.au_alignment_eta,
+            )
+            if any(value is None or not math.isfinite(value) or value < 0 for value in values):
+                raise ValueError("Enabled AU alignment requires non-negative calibrated values")
+            if (
+                self.au_alignment_q_c is None
+                or len(self.au_alignment_q_c) != 12
+                or any(not math.isfinite(value) or value < 0 for value in self.au_alignment_q_c)
+            ):
+                raise ValueError("Enabled AU alignment requires 12 finite non-negative q_c values")
 
 
 class AdaptationTrainer:
@@ -63,6 +101,8 @@ class AdaptationTrainer:
         str_service=None,
         refresh_fn=refresh_target_supervision,
         source_checkpoint=None,
+        source_au_cache=None,
+        target_au_cache=None,
     ):
         self.model = model
         self.prototype_banks = prototype_banks
@@ -84,6 +124,8 @@ class AdaptationTrainer:
         self.str_service = str_service
         self.refresh_fn = refresh_fn
         self.source_checkpoint = str(source_checkpoint) if source_checkpoint is not None else None
+        self.source_au_cache = Path(source_au_cache).resolve() if source_au_cache else None
+        self.target_au_cache = Path(target_au_cache).resolve() if target_au_cache else None
         self.supervision = None
         self.completed_epoch = 0
         self.global_step = 0
@@ -103,6 +145,10 @@ class AdaptationTrainer:
             raise ValueError("target_sample_ids must be a non-empty unique sequence")
         if config.str_epochs and str_service is None:
             raise ValueError("Scheduled STR epochs require a str_service")
+        if (config.au_mode != "off" or config.au_alignment_enabled) and (
+            self.source_au_cache is None or self.target_au_cache is None
+        ):
+            raise ValueError("AU cache paths are required when AU features are enabled")
 
         self.model.to(self.device)
         self.prototype_banks.to(self.device)
@@ -149,8 +195,57 @@ class AdaptationTrainer:
     def train_step(self, source_batch, target_batch):
         if self.supervision is None:
             raise RuntimeError("Target supervision must be refreshed before training")
-        source_images, source_labels = source_batch
-        target_images, sample_ids = target_batch
+        needs_au = self.config.au_mode != "off" or self.config.au_alignment_enabled
+        if not needs_au:
+            source_images, source_labels = source_batch
+            target_images, sample_ids = target_batch
+            source_au = target_au = None
+        else:
+            source_images, source_labels, source_au = source_batch
+            target_images, sample_ids, target_au = target_batch
+        au_metadata_metrics = (
+            {
+                "au_source_missing_ratio": float((~source_au["au_valid"]).float().mean()),
+                "au_target_missing_ratio": float((~target_au["au_valid"]).float().mean()),
+                "au_source_landmark_missing_ratio": float(
+                    (~source_au["landmark_valid"]).float().mean()
+                ),
+                "au_target_landmark_missing_ratio": float(
+                    (~target_au["landmark_valid"]).float().mean()
+                ),
+            }
+            if needs_au
+            else {}
+        )
+        if self.config.au_mode == "off":
+            guidance = None
+            guidance_metrics = {}
+        else:
+            source_p, target_p = source_au["au"], target_au["au"]
+            shuffled = 0
+            if self.config.au_mode == "dynamic_shuffled":
+                source_p, source_changed = shuffle_valid_au(source_p, source_au["au_valid"])
+                target_p, target_changed = shuffle_valid_au(target_p, target_au["au_valid"])
+                shuffled = source_changed + target_changed
+            valid_pairs = (
+                source_au["au_valid"]
+                & source_au["landmark_valid"]
+                & target_au["au_valid"]
+                & target_au["landmark_valid"]
+            )
+            guidance = compute_guidance(
+                target_p,
+                source_p,
+                target_au["mask"],
+                source_au["mask"],
+                valid_pairs,
+            ).to(self.device)
+            guidance_metrics = {
+                "au_nonzero_pair_ratio": float(valid_pairs.float().mean()),
+                "au_shuffled_ratio": shuffled / (2 * len(source_images)),
+                "au_g_mean": float(guidance.mean()),
+                "au_g_std": float(guidance.std()),
+            }
         if len(source_images) != len(target_images):
             raise ValueError("Paired source and target batches must have the same size")
         pseudo_labels, trusted_mask = self.supervision.lookup(list(sample_ids))
@@ -162,7 +257,11 @@ class AdaptationTrainer:
         with torch.autocast(
             device_type=self.device.type, dtype=torch.float16, enabled=self.config.amp
         ):
-            features = self.model.forward_features(source_images, target_images)
+            features = (
+                self.model.forward_features(source_images, target_images)
+                if guidance is None
+                else self.model.forward_features(source_images, target_images, guidance)
+            )
             losses = compute_prototype_losses(
                 features,
                 self.prototype_banks,
@@ -182,7 +281,28 @@ class AdaptationTrainer:
                 + self.config.beta * losses.l_s2t
                 + self.config.gamma * adversarial_loss
             )
-            total = loss_in + loss_cross
+            alignment = None
+            if self.config.au_alignment_enabled:
+                if features.source_native_tokens is None or features.target_native_tokens is None:
+                    raise RuntimeError("AU alignment requires source and target native tokens")
+                alignment = compute_au_alignment(
+                    features.source_native_tokens,
+                    features.target_native_tokens,
+                    source_au,
+                    target_au,
+                    tau_mask=self.config.au_alignment_tau_mask,
+                    n_eff_min=self.config.au_alignment_n_eff_min,
+                    q_c=self.config.au_alignment_q_c,
+                    epsilon=self.config.au_alignment_epsilon,
+                    epsilon_weight=self.config.au_alignment_epsilon_weight,
+                )
+            loss_local = alignment.loss if alignment is not None else loss_in * 0
+            weighted_local = (
+                self.config.au_alignment_eta * loss_local
+                if self.config.au_alignment_enabled
+                else loss_local
+            )
+            total = loss_in + loss_cross + weighted_local
 
         if self.config.amp:
             self.scaler.scale(total).backward()
@@ -192,6 +312,27 @@ class AdaptationTrainer:
             total.backward()
             self.optimizer.step()
         self.global_step += 1
+        alignment_metrics = {}
+        if alignment is not None:
+            alignment_metrics = {
+                "loss_local": float(loss_local.detach()),
+                "loss_local_weighted": float(weighted_local.detach()),
+                "au_alignment_valid_count": float(alignment.valid_aus.sum()),
+                "au_alignment_has_loss": float(alignment.valid_aus.any()),
+            }
+            for index in range(12):
+                alignment_metrics[f"au_alignment_source_n_eff_{index}"] = float(
+                    alignment.source_n_eff[index]
+                )
+                alignment_metrics[f"au_alignment_target_n_eff_{index}"] = float(
+                    alignment.target_n_eff[index]
+                )
+                alignment_metrics[f"au_alignment_source_weight_{index}"] = float(
+                    alignment.source_weight_sums[index]
+                )
+                alignment_metrics[f"au_alignment_target_weight_{index}"] = float(
+                    alignment.target_weight_sums[index]
+                )
         return {
             "loss_total": float(total.detach()),
             "loss_in": float(loss_in.detach()),
@@ -205,6 +346,10 @@ class AdaptationTrainer:
             "trusted_ratio": losses.num_trusted / len(source_images),
             "learning_rate": self.optimizer.param_groups[0]["lr"],
             **getattr(self.adversarial_module, "last_metrics", {}),
+            **au_metadata_metrics,
+            **guidance_metrics,
+            **alignment_metrics,
+            **getattr(getattr(self.model, "bcs_block1", None), "last_guidance_metrics", {}),
         }
 
     def train_epoch(self, *, progress=False):
@@ -355,6 +500,14 @@ class AdaptationTrainer:
             "class_mapping": list(CLASSES[: self.config.num_classes]),
             "feature_dim": self.prototype_banks.source_prototypes.shape[1],
             "source_checkpoint": self.source_checkpoint,
+            "au_cache_identity": (
+                {
+                    "source": sha256(self.source_au_cache),
+                    "target": sha256(self.target_au_cache),
+                }
+                if self.config.au_mode != "off" or self.config.au_alignment_enabled
+                else None
+            ),
             "boundary_completed": self.boundary_completed,
             "expected_str_round_id": (
                 self._round_id(self.completed_epoch)
@@ -405,8 +558,33 @@ class AdaptationTrainer:
             raise ValueError("Unsupported adaptation checkpoint schema")
         if state.get("target_sample_ids") != self.target_sample_ids:
             raise ValueError("Saved target sample_ids differ from the adaptation dataset")
-        if state.get("config") != asdict(self.config):
+        saved_config = dict(state.get("config", {}))
+        saved_config.setdefault("au_mode", "off")
+        saved_config.setdefault("au_g_scale", 1.0)
+        saved_config.setdefault("au_lambda_learning_rate", 0.01)
+        saved_config.setdefault("au_alignment_enabled", False)
+        saved_config.setdefault("au_alignment_tau_mask", None)
+        saved_config.setdefault("au_alignment_n_eff_min", None)
+        saved_config.setdefault("au_alignment_q_c", None)
+        saved_config.setdefault("au_alignment_epsilon", 1.0e-8)
+        saved_config.setdefault("au_alignment_epsilon_weight", 1.0e-8)
+        saved_config.setdefault("au_alignment_r_target", 0.1)
+        saved_config.setdefault("au_alignment_eta", None)
+        if saved_config != asdict(self.config):
             raise ValueError("Saved adaptation configuration differs from the current run")
+        expected_au_identity = (
+            {
+                "source": sha256(self.source_au_cache),
+                "target": sha256(self.target_au_cache),
+            }
+            if self.config.au_mode != "off" or self.config.au_alignment_enabled
+            else None
+        )
+        if (
+            state.get("boundary_completed")
+            and state.get("au_cache_identity") != expected_au_identity
+        ):
+            raise ValueError("Saved AU caches differ from the current run")
         if state.get("class_mapping") != list(CLASSES[: self.config.num_classes]):
             raise ValueError("Saved class mapping differs from the current run")
         if state.get("feature_dim") != self.prototype_banks.source_prototypes.shape[1]:

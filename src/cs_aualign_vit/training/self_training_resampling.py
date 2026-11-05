@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import subprocess
 from pathlib import Path
 
 import torch
@@ -45,6 +46,8 @@ class SelfTrainingResampler:
         num_workers=0,
         num_classes=7,
         confidence_threshold=0.95,
+        au_cache=None,
+        au_python=None,
     ):
         dataset = target_feature_loader.dataset
         if not isinstance(dataset, FaceDataset) or dataset.role != "target_features":
@@ -65,6 +68,12 @@ class SelfTrainingResampler:
         self.num_workers = num_workers
         self.num_classes = num_classes
         self.confidence_threshold = confidence_threshold
+        self.au_cache = Path(au_cache).resolve() if au_cache is not None else None
+        self.au_python = Path(au_python).resolve() if au_python is not None else None
+        if (self.au_cache is None) != (self.au_python is None):
+            raise ValueError("au_cache and au_python must be configured together")
+        if self.au_python is not None and not self.au_python.is_file():
+            raise FileNotFoundError(f"LibreFace Python executable not found: {self.au_python}")
         source = FaceDataset(self.source_manifest, "source_train")
         usable = {s["sample_id"] for s in source.samples}
         self._donors = {c: [] for c in range(num_classes)}
@@ -232,6 +241,19 @@ class SelfTrainingResampler:
             else:
                 rows.append(row)
         created = sum(row["round_id"] == round_id for row in rows)
+        if self.au_cache is not None and created:
+            extractor = Path(__file__).resolve().parents[3] / "scripts" / "extract_au_cache.py"
+            subprocess.run(
+                [
+                    str(self.au_python),
+                    str(extractor),
+                    "--manifest",
+                    str(self.manifest_path),
+                    "--output",
+                    str(self.au_cache),
+                ],
+                check=True,
+            )
         counts_after = self._counts(rows)
         completed = {
             **transaction,
@@ -298,4 +320,5 @@ class SelfTrainingResampler:
             seed=self.global_seed + round_id,
             num_workers=self.num_workers,
             transform=source_transform,
+            au_cache=self.au_cache,
         )

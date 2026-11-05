@@ -81,6 +81,27 @@ def test_bcs_directions_keep_native_independence_and_cross_gradients():
     assert block.target.attn.qkv.weight.grad is not None
 
 
+def test_zero_lambda_matches_baseline_and_guidance_changes_only_cross_streams():
+    pretrained = swin_t(weights=None).features[7][1]
+    baseline = BCSBlock(pretrained).eval()
+    guided = BCSBlock(pretrained, au_mode="dynamic", g_scale=10.0).eval()
+    source = torch.randn(1, 7, 7, 768)
+    target = torch.randn(1, 7, 7, 768)
+    guidance = torch.rand(1, 49, 49)
+
+    with torch.no_grad():
+        expected = baseline(source, target)
+        zero = guided(source, target, guidance)
+        guided.lambda_target_to_source.fill_(1)
+        guided.lambda_source_to_target.fill_(1)
+        changed = guided(source, target, guidance)
+
+    assert all(torch.allclose(left, right) for left, right in zip(expected, zero, strict=True))
+    assert torch.equal(zero[0], changed[0]) and torch.equal(zero[1], changed[1])
+    assert not torch.allclose(zero[2], changed[2])
+    assert not torch.allclose(zero[3], changed[3])
+
+
 def test_cross_attention_uses_exact_qkv_direction_and_destination_components():
     block = BCSBlock(swin_t(weights=None).features[7][1]).eval()
     source = torch.randn(1, 7, 7, 768)
@@ -186,6 +207,9 @@ def test_forward_boundary_and_checkpoint_validation(tmp_path):
 
     assert outputs.source_features.shape == outputs.target_features.shape == (1, 768)
     assert outputs.target_to_source_features.shape == outputs.source_to_target_features.shape == (1, 768)
+    assert outputs.source_native_tokens.shape == outputs.target_native_tokens.shape == (1, 49, 768)
+    assert torch.equal(outputs.source_features, outputs.source_native_tokens.mean(dim=1))
+    assert torch.equal(outputs.target_features, outputs.target_native_tokens.mean(dim=1))
     assert torch.equal(outputs.source_features, norm_outputs["source"][0].mean(dim=(1, 2)))
     assert torch.equal(outputs.target_to_source_features, norm_outputs["source"][1].mean(dim=(1, 2)))
     assert torch.equal(outputs.target_features, norm_outputs["target"][0].mean(dim=(1, 2)))

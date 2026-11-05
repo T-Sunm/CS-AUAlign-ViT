@@ -17,17 +17,32 @@ class BCSFeatures:
     target_features: torch.Tensor
     target_to_source_features: torch.Tensor
     source_to_target_features: torch.Tensor
+    source_native_tokens: torch.Tensor | None = None
+    target_native_tokens: torch.Tensor | None = None
 
 
 class BCSBlock(nn.Module):
     """Run native and cross attention from the same pair of pretrained QKV tensors."""
 
-    def __init__(self, pretrained_block):
+    def __init__(self, pretrained_block, *, au_mode="off", g_scale=1.0):
         super().__init__()
         self.source = deepcopy(pretrained_block)
         self.target = deepcopy(pretrained_block)
         if self.source.attn.num_heads != 24:
             raise ValueError("POST BCS requires the 24-head Swin-T Stage 4 block")
+        if au_mode not in {"off", "dynamic", "dynamic_shuffled"}:
+            raise ValueError("au_mode must be off, dynamic, or dynamic_shuffled")
+        if g_scale <= 0:
+            raise ValueError("g_scale must be positive")
+        self.au_mode = au_mode
+        self.g_scale = float(g_scale)
+        if au_mode == "off":
+            self.register_parameter("lambda_target_to_source", None)
+            self.register_parameter("lambda_source_to_target", None)
+        else:
+            self.lambda_target_to_source = nn.Parameter(torch.zeros(24))
+            self.lambda_source_to_target = nn.Parameter(torch.zeros(24))
+        self.last_guidance_metrics = {}
 
     @staticmethod
     def _qkv(block, inputs):
@@ -41,10 +56,30 @@ class BCSBlock(nn.Module):
         return query, key, value
 
     @staticmethod
-    def _attention(block, query, key, value):
+    def _attention(block, query, key, value, bias=None, metrics=None, valid_batches=None):
         logits = (query * query.shape[-1] ** -0.5) @ key.transpose(-2, -1)
         logits = logits + block.attn.get_relative_position_bias()
-        weights = F.softmax(logits, dim=-1)
+        if bias is None:
+            weights = F.softmax(logits, dim=-1)
+        else:
+            baseline = F.softmax(logits, dim=-1)
+            weights = F.softmax(logits + bias, dim=-1)
+        if metrics is not None and bias is not None:
+            change = 0.5 * (weights - baseline).abs().sum(dim=-1)
+            newly_saturated = (baseline.amax(-1) < 0.95) & (weights.amax(-1) >= 0.95)
+            if valid_batches is not None and valid_batches.any():
+                change = change[valid_batches]
+                newly_saturated = newly_saturated[valid_batches]
+                measured_bias = bias[valid_batches]
+                measured_logits = logits[valid_batches]
+                metrics.update(
+                    attention_change_p90=float(torch.quantile(change.detach().float(), 0.9)),
+                    saturation_rate=float(newly_saturated.detach().float().mean()),
+                    bias_logits_std_ratio=float(
+                        measured_bias.detach().float().std()
+                        / measured_logits.detach().float().std().clamp_min(1e-12)
+                    ),
+                )
         weights = F.dropout(weights, p=block.attn.attention_dropout, training=block.training)
         output = weights @ value
         batch, _heads, tokens, _head_dim = output.shape
@@ -62,18 +97,58 @@ class BCSBlock(nn.Module):
     def _finish_mlp(block, inputs):
         return inputs + block.stochastic_depth(block.mlp(block.norm2(inputs)))
 
-    def forward(self, source, target):
+    def forward(self, source, target, guidance=None):
         if source.shape != target.shape:
             raise ValueError("Source and target token grids must have the same shape")
         if source.ndim != 4 or source.shape[1:] != (7, 7, 768):
             raise ValueError("BCS Block 1 expects token grids with shape [B, 7, 7, 768]")
+        if self.au_mode == "off" and guidance is not None:
+            raise ValueError("off mode does not accept AU guidance")
+        if self.au_mode != "off":
+            if guidance is None or guidance.shape != (source.shape[0], 49, 49):
+                raise ValueError("AU guidance must have shape [B, 49, 49]")
+            guidance = guidance.to(device=source.device, dtype=source.dtype)
 
         qs, ks, vs = self._qkv(self.source, source)
         qt, kt, vt = self._qkv(self.target, target)
         source_native = self._attention(self.source, qs, ks, vs)
         target_native = self._attention(self.target, qt, kt, vt)
-        target_to_source = self._attention(self.source, qt, ks, vs)
-        source_to_target = self._attention(self.target, qs, kt, vt)
+        self.last_guidance_metrics = {}
+        target_metrics, source_metrics = {}, {}
+        target_bias = source_bias = None
+        if guidance is not None:
+            valid_batches = guidance.abs().sum(dim=(-2, -1)) > 0
+            target_bias = (
+                self.g_scale
+                * self.lambda_target_to_source[None, :, None, None]
+                * guidance[:, None]
+            ).to(source.dtype)
+            source_bias = (
+                self.g_scale
+                * self.lambda_source_to_target[None, :, None, None]
+                * guidance.transpose(-2, -1)[:, None]
+            ).to(source.dtype)
+        target_to_source = self._attention(
+            self.source,
+            qt,
+            ks,
+            vs,
+            target_bias,
+            target_metrics if guidance is not None else None,
+            valid_batches if guidance is not None else None,
+        )
+        source_to_target = self._attention(
+            self.target,
+            qs,
+            kt,
+            vt,
+            source_bias,
+            source_metrics if guidance is not None else None,
+            valid_batches if guidance is not None else None,
+        )
+        self.last_guidance_metrics = {
+            f"au_t2s_{name}": value for name, value in target_metrics.items()
+        } | {f"au_s2t_{name}": value for name, value in source_metrics.items()}
 
         source_native = self._finish_attention(self.source, source, source_native)
         target_to_source = self._finish_attention(self.source, source, target_to_source)
@@ -99,19 +174,21 @@ class BCSBlock(nn.Module):
 class POSTBCSModel(nn.Module):
     feature_dim = 768
 
-    def __init__(self, pretrained_backbone):
+    def __init__(self, pretrained_backbone, *, au_mode="off", g_scale=1.0):
         super().__init__()
         if len(pretrained_backbone.features) != 8 or len(pretrained_backbone.features[7]) != 2:
             raise ValueError("Expected the torchvision Swin-T feature layout")
         self.shared_trunk = deepcopy(nn.Sequential(*pretrained_backbone.features[:7]))
         self.source_block0 = deepcopy(pretrained_backbone.features[7][0])
         self.target_block0 = deepcopy(pretrained_backbone.features[7][0])
-        self.bcs_block1 = BCSBlock(pretrained_backbone.features[7][1])
+        self.bcs_block1 = BCSBlock(
+            pretrained_backbone.features[7][1], au_mode=au_mode, g_scale=g_scale
+        )
         self.source_norm = deepcopy(pretrained_backbone.norm)
         self.target_norm = deepcopy(pretrained_backbone.norm)
 
     @classmethod
-    def from_source_checkpoint(cls, path):
+    def from_source_checkpoint(cls, path, *, au_mode="off", g_scale=1.0):
         from torchvision.models import swin_t
 
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
@@ -133,7 +210,7 @@ class POSTBCSModel(nn.Module):
             backbone.load_state_dict(state, strict=True)
         except RuntimeError as error:
             raise ValueError("Source checkpoint is incompatible with torchvision Swin-T") from error
-        return cls(backbone)
+        return cls(backbone, au_mode=au_mode, g_scale=g_scale)
 
     @staticmethod
     def _validate_images(images, name):
@@ -143,6 +220,11 @@ class POSTBCSModel(nn.Module):
     @staticmethod
     def _pool(tokens, norm):
         return norm(tokens).mean(dim=(1, 2))
+
+    @staticmethod
+    def _normalized_tokens(tokens, norm):
+        normalized = norm(tokens)
+        return normalized.reshape(normalized.shape[0], 49, normalized.shape[-1])
 
     def _native_tokens(self, images, domain):
         if domain not in {"source", "target"}:
@@ -155,7 +237,7 @@ class POSTBCSModel(nn.Module):
     def forward_target_features(self, target_images):
         return self._pool(self._native_tokens(target_images, "target"), self.target_norm)
 
-    def forward_features(self, source_images, target_images):
+    def forward_features(self, source_images, target_images, guidance=None):
         self._validate_images(source_images, "source images")
         self._validate_images(target_images, "target images")
         if source_images.shape[0] != target_images.shape[0]:
@@ -165,13 +247,19 @@ class POSTBCSModel(nn.Module):
         source, target = combined.split((source_images.shape[0], target_images.shape[0]))
         source = self.source_block0(source)
         target = self.target_block0(target)
-        source, target, target_to_source, source_to_target = self.bcs_block1(source, target)
+        source, target, target_to_source, source_to_target = self.bcs_block1(
+            source, target, guidance
+        )
+        source_native_tokens = self._normalized_tokens(source, self.source_norm)
+        target_native_tokens = self._normalized_tokens(target, self.target_norm)
         return BCSFeatures(
-            source_features=self._pool(source, self.source_norm),
-            target_features=self._pool(target, self.target_norm),
+            source_features=source_native_tokens.mean(dim=1),
+            target_features=target_native_tokens.mean(dim=1),
             target_to_source_features=self._pool(target_to_source, self.source_norm),
             source_to_target_features=self._pool(source_to_target, self.target_norm),
+            source_native_tokens=source_native_tokens,
+            target_native_tokens=target_native_tokens,
         )
 
-    def forward(self, source_images, target_images):
-        return self.forward_features(source_images, target_images)
+    def forward(self, source_images, target_images, guidance=None):
+        return self.forward_features(source_images, target_images, guidance)
