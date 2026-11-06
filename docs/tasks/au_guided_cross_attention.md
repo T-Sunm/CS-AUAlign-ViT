@@ -38,6 +38,13 @@ cache trước khi source loader được rebuild. Retry/resume không tạo rec
 trùng. STR tiếp tục dùng lịch và ảnh ghép của Task 5; landmark của ảnh ghép
 hiện kế thừa donor, nên kiểm tra mask trên vài ảnh STR.
 
+Extractor có thể retry có chọn lọc các record `failed` bằng
+`--retry-failed --retry-error-type <ExceptionType>`. Record `success` và các
+loại lỗi không được chọn giữ nguyên; kết quả retry thay record cũ theo
+`sample_id` và CSV vẫn được ghi atomically, không thêm dòng trùng. LibreFace
+được giới hạn một mặt mỗi crop và dùng `LANCZOS` thay API `ANTIALIAS` đã bị
+gỡ để tương thích với dependency hiện tại.
+
 ## 3. Mask, `G` và attention
 
 Dùng năm MTCNN `landmarks_crop` và kích thước crop thực tế để đặt Gaussian
