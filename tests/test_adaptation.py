@@ -5,6 +5,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
+import cs_aualign_vit.training.adaptation as adaptation_module
+from cs_aualign_vit.data.au_guidance import compute_guidance
 from cs_aualign_vit.models import AdversarialAlignment, BCSFeatures, PrototypeBanks
 from cs_aualign_vit.training import AdaptationConfig, AdaptationTrainer, TargetSupervision
 
@@ -65,7 +67,7 @@ class GuidedDataset(Dataset):
             "landmark_valid": True,
         }
         identity = self.sample_ids[index] if self.target else 0
-        return torch.tensor([1.0, float(index)]), identity, metadata
+        return torch.tensor([1.0 + float(self.target), float(index)]), identity, metadata
 
 
 class FakeSTR:
@@ -284,7 +286,7 @@ def test_dynamic_shuffled_builds_guidance_from_paired_metadata(tmp_path):
     assert metrics["au_shuffled_ratio"] in {0, 0.5, 1}
 
 
-def test_alignment_runs_with_attention_off_and_logs_local_metrics(tmp_path):
+def build_aligned_trainer(tmp_path, *, eta=0.1, mode="normal", au_mode="off"):
     source = GuidedDataset()
     target = GuidedDataset(target=True)
     source_loader = DataLoader(source, batch_size=2, drop_last=True)
@@ -298,7 +300,7 @@ def test_alignment_runs_with_attention_off_and_logs_local_metrics(tmp_path):
     source_cache, target_cache = tmp_path / "source.csv", tmp_path / "target.csv"
     source_cache.write_text("source")
     target_cache.write_text("target")
-    trainer = AdaptationTrainer(
+    return AdaptationTrainer(
         model=model,
         prototype_banks=banks,
         adversarial_module=adversary,
@@ -315,23 +317,124 @@ def test_alignment_runs_with_attention_off_and_logs_local_metrics(tmp_path):
             kmeans_interval=1,
             str_epochs=(),
             num_classes=2,
+            au_mode=au_mode,
             au_alignment_enabled=True,
+            au_alignment_mode=mode,
             au_alignment_tau_mask=1.0,
             au_alignment_n_eff_min=1.0,
             au_alignment_q_c=(1.0,) * 12,
-            au_alignment_eta=0.1,
+            au_alignment_eta=eta,
         ),
         source_au_cache=source_cache,
         target_au_cache=target_cache,
     )
-    trainer.supervision = make_supervision(target.sample_ids)
 
-    metrics = trainer.train_step(next(iter(source_loader)), next(iter(target_loader)))
 
-    assert model.last_guidance is None
-    assert metrics["loss_local"] >= 0
-    assert metrics["loss_local_weighted"] == pytest.approx(0.1 * metrics["loss_local"])
-    assert metrics["au_alignment_valid_count"] == 12
+def test_alignment_smoke_steps_checkpoint_and_resume(tmp_path):
+    trainer = build_aligned_trainer(tmp_path)
+    trainer.supervision = make_supervision(trainer.target_sample_ids)
+    source_batch = next(iter(trainer.source_loader))
+    target_batch = next(iter(trainer.target_loader))
+
+    rows = [trainer.train_step(source_batch, target_batch) for _ in range(2)]
+    trainer.save_checkpoint()
+
+    resumed = build_aligned_trainer(tmp_path)
+    resumed.load_checkpoint()
+    assert resumed.global_step == 2
+    rows.append(resumed.train_step(source_batch, target_batch))
+
+    for metrics in rows:
+        assert all(
+            torch.isfinite(torch.tensor(value))
+            for value in metrics.values()
+            if isinstance(value, (int, float))
+        )
+        assert metrics["loss_local"] >= 0
+        assert metrics["loss_local_weighted"] == pytest.approx(0.1 * metrics["loss_local"])
+        assert metrics["au_alignment_valid_count"] == 12
+        assert metrics["au_alignment_has_loss"] == 1
+        assert all(metrics[f"au_alignment_source_n_eff_{index}"] >= 1 for index in range(12))
+        assert all(metrics[f"au_alignment_target_n_eff_{index}"] >= 1 for index in range(12))
+    assert resumed.model.last_guidance is None
+    assert resumed.global_step == 3
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for module in (resumed.model, resumed.prototype_banks, resumed.adversarial_module)
+        for parameter in module.parameters()
+    )
+
+    epoch_path = tmp_path / "epoch"
+    epoch_path.mkdir()
+    epoch_trainer = build_aligned_trainer(epoch_path)
+    epoch_trainer.supervision = make_supervision(epoch_trainer.target_sample_ids)
+    epoch_metrics = epoch_trainer.train_epoch()
+    assert sum(
+        epoch_metrics[f"au_alignment_contribution_{index}"] for index in range(12)
+    ) == pytest.approx(1.0)
+
+    mismatched = build_aligned_trainer(tmp_path, eta=0.2)
+    with pytest.raises(ValueError, match="configuration differs"):
+        mismatched.load_checkpoint()
+
+    changed_cache = build_aligned_trainer(tmp_path)
+    (tmp_path / "source.csv").write_text("changed")
+    with pytest.raises(ValueError, match="AU caches differ"):
+        changed_cache.load_checkpoint()
+
+
+def test_alignment_shuffle_rng_round_trips_checkpoint(tmp_path):
+    trainer = build_aligned_trainer(tmp_path, mode="shuffled")
+    trainer.supervision = make_supervision(trainer.target_sample_ids)
+    trainer.train_step(next(iter(trainer.source_loader)), next(iter(trainer.target_loader)))
+    trainer.save_checkpoint()
+    expected = torch.randperm(16, generator=trainer._alignment_shuffle_generator)
+
+    resumed = build_aligned_trainer(tmp_path, mode="shuffled")
+    resumed.load_checkpoint()
+    actual = torch.randperm(16, generator=resumed._alignment_shuffle_generator)
+
+    assert torch.equal(actual, expected)
+
+
+def test_alignment_shuffle_does_not_change_attention_metadata(tmp_path, monkeypatch):
+    observed = {}
+    real_alignment = adaptation_module.compute_au_alignment
+
+    def reverse_valid(values, valid, *, generator=None):
+        indices = torch.nonzero(valid, as_tuple=False).flatten()
+        shuffled = values.clone()
+        shuffled[indices] = values[indices.flip(0)]
+        return shuffled, len(indices)
+
+    def capture_alignment(source_tokens, target_tokens, source_au, target_au, **options):
+        observed["source"] = source_au["au"].clone()
+        observed["target"] = target_au["au"].clone()
+        return real_alignment(
+            source_tokens, target_tokens, source_au, target_au, **options
+        )
+
+    monkeypatch.setattr(adaptation_module, "shuffle_valid_au", reverse_valid)
+    monkeypatch.setattr(adaptation_module, "compute_au_alignment", capture_alignment)
+    trainer = build_aligned_trainer(tmp_path, mode="shuffled", au_mode="dynamic")
+    trainer.supervision = make_supervision(trainer.target_sample_ids)
+    source_batch = next(iter(trainer.source_loader))
+    target_batch = next(iter(trainer.target_loader))
+    source_meta, target_meta = source_batch[2], target_batch[2]
+    valid_pairs = torch.ones(len(source_batch[0]), dtype=torch.bool)
+    expected_guidance = compute_guidance(
+        target_meta["au"],
+        source_meta["au"],
+        target_meta["mask"],
+        source_meta["mask"],
+        valid_pairs,
+    )
+
+    trainer.train_step(source_batch, target_batch)
+
+    assert torch.equal(trainer.model.last_guidance, expected_guidance)
+    assert torch.equal(observed["source"], source_meta["au"].flip(0))
+    assert torch.equal(observed["target"], target_meta["au"].flip(0))
 
 
 def test_empty_paired_loader_fails_with_actionable_context(tmp_path):

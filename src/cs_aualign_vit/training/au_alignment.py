@@ -17,6 +17,8 @@ class AUAlignmentResult:
     source_weight_sums: torch.Tensor
     target_weight_sums: torch.Tensor
     valid_aus: torch.Tensor
+    distances: torch.Tensor
+    loss_components: torch.Tensor
 
 
 def _domain_statistics(tokens, intensities, masks, au_valid, landmark_valid, tau_mask, epsilon):
@@ -102,7 +104,8 @@ def compute_au_alignment(
     )
     weights = q_c * valid_aus.to(q_c.dtype)
     distances = (source_centroids - target_centroids).square().sum(dim=-1)
-    loss = (weights * distances).sum() / (weights.sum() + epsilon)
+    loss_components = weights * distances / (weights.sum() + epsilon)
+    loss = loss_components.sum()
     return AUAlignmentResult(
         loss=loss,
         source_region_features=source_regions,
@@ -114,4 +117,6 @@ def compute_au_alignment(
         source_weight_sums=source_sums,
         target_weight_sums=target_sums,
         valid_aus=valid_aus,
+        distances=distances,
+        loss_components=loss_components,
     )

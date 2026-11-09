@@ -43,6 +43,7 @@ def validate_config(config):
         "au_alignment",
         {
             "enabled": False,
+            "mode": "normal",
             "tau_mask": None,
             "n_eff_min": None,
             "q_c": None,
@@ -63,6 +64,7 @@ def validate_config(config):
     )
     if any(not isinstance(config.get(section), dict) for section in sections):
         raise ValueError("Incomplete adaptation configuration")
+    config["au_alignment"].setdefault("mode", "normal")
     required = {
         "training": {
             "max_epochs",
@@ -84,6 +86,7 @@ def validate_config(config):
         "au_guidance": {"mode", "g_scale", "lambda_learning_rate"},
         "au_alignment": {
             "enabled",
+            "mode",
             "tau_mask",
             "n_eff_min",
             "q_c",
@@ -108,6 +111,8 @@ def validate_config(config):
     alignment = config["au_alignment"]
     if type(alignment["enabled"]) is not bool:
         raise ValueError("au_alignment.enabled must be true or false")
+    if alignment["mode"] not in {"normal", "shuffled"}:
+        raise ValueError("au_alignment.mode must be normal or shuffled")
     if alignment["epsilon"] <= 0 or alignment["epsilon_weight"] < 0:
         raise ValueError("Invalid AU alignment epsilons")
     if alignment["r_target"] <= 0:
@@ -148,6 +153,28 @@ def resolve_output(output, resume, runs_dir=Path("runs/adaptation")):
             index += 1
 
 
+def prepare_run_files(output, config, source_au_cache=None, *, resume=False):
+    """Persist resolved config and isolate the mutable source AU cache."""
+    resolved_config = output / "resolved_config.yaml"
+    if resolved_config.exists():
+        if yaml.safe_load(resolved_config.read_text()) != config:
+            raise ValueError("Resolved adaptation configuration differs from the current run")
+    else:
+        resolved_config.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    if source_au_cache is None:
+        return None
+    working_cache = output / "source_au_cache.csv"
+    if resume:
+        if not working_cache.is_file():
+            raise FileNotFoundError(f"Run source AU cache is missing: {working_cache}")
+    else:
+        if working_cache.exists():
+            raise FileExistsError(f"Run source AU cache already exists: {working_cache}")
+        shutil.copy2(source_au_cache, working_cache)
+    return working_cache
+
+
 def run(args):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     config = validate_config(yaml.safe_load(args.config.read_text()))
@@ -169,11 +196,19 @@ def run(args):
     alignment = config["au_alignment"]
     guidance_enabled = guidance["mode"] != "off"
     au_enabled = guidance_enabled or alignment["enabled"]
-    source_au_cache = getattr(args, "source_au_cache", None)
+    original_source_au_cache = getattr(args, "source_au_cache", None)
     target_au_cache = getattr(args, "target_au_cache", None)
     au_python = getattr(args, "au_python", Path(".venv-au/bin/python"))
-    if au_enabled and (source_au_cache is None or target_au_cache is None):
+    if au_enabled and (original_source_au_cache is None or target_au_cache is None):
         raise ValueError("AU modes require --source-au-cache and --target-au-cache")
+    output = resolve_output(args.output, args.resume)
+    source_au_cache = prepare_run_files(
+        output,
+        config,
+        original_source_au_cache if au_enabled else None,
+        resume=args.resume is not None,
+    )
+    LOGGER.info("adaptation output: %s", output)
     source_state = torch.load(args.source_checkpoint, map_location="cpu", weights_only=True)
     if source_state.get("preprocessing_config") != preprocessing:
         raise ValueError("Adaptation preprocessing differs from the source checkpoint")
@@ -246,6 +281,7 @@ def run(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training["max_epochs"])
     scaler = torch.cuda.amp.GradScaler(enabled=training["amp"])
     adaptation_config = AdaptationConfig(
+        seed=seed,
         max_epochs=training["max_epochs"],
         kmeans_interval=training["kmeans_interval"],
         str_epochs=tuple(training["str_epochs"]),
@@ -255,6 +291,7 @@ def run(args):
         au_g_scale=guidance["g_scale"],
         au_lambda_learning_rate=guidance["lambda_learning_rate"],
         au_alignment_enabled=alignment["enabled"],
+        au_alignment_mode=alignment["mode"],
         au_alignment_tau_mask=alignment["tau_mask"],
         au_alignment_n_eff_min=alignment["n_eff_min"],
         au_alignment_q_c=(
@@ -266,8 +303,6 @@ def run(args):
         au_alignment_eta=alignment["eta"],
         **config["loss"],
     )
-    output = resolve_output(args.output, args.resume)
-    LOGGER.info("adaptation output: %s", output)
     resampler = SelfTrainingResampler(
         source_manifest=args.source_manifest,
         target_feature_loader=target_feature_loader,

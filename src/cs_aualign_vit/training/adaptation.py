@@ -26,6 +26,7 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class AdaptationConfig:
+    seed: int = 42
     max_epochs: int = 256
     kmeans_interval: int = 10
     str_epochs: tuple[int, ...] = tuple(range(25, 251, 25))
@@ -38,6 +39,7 @@ class AdaptationConfig:
     au_g_scale: float = 1.0
     au_lambda_learning_rate: float = 0.01
     au_alignment_enabled: bool = False
+    au_alignment_mode: str = "normal"
     au_alignment_tau_mask: float | None = None
     au_alignment_n_eff_min: float | None = None
     au_alignment_q_c: tuple[float, ...] | None = None
@@ -59,6 +61,8 @@ class AdaptationConfig:
             raise ValueError("AU scale and lambda learning rate must be positive")
         if type(self.au_alignment_enabled) is not bool:
             raise ValueError("au_alignment_enabled must be boolean")
+        if self.au_alignment_mode not in {"normal", "shuffled"}:
+            raise ValueError("au_alignment_mode must be normal or shuffled")
         if self.au_alignment_epsilon <= 0 or self.au_alignment_epsilon_weight < 0:
             raise ValueError("AU alignment epsilons are invalid")
         if self.au_alignment_r_target <= 0:
@@ -132,6 +136,9 @@ class AdaptationTrainer:
         self.boundary_completed = True
         self._source_restored = False
         self._source_generator_state = None
+        self._alignment_shuffle_generator = torch.Generator().manual_seed(
+            self.config.seed + 2
+        )
 
         config = self.config
         if config.amp and (self.device.type != "cuda" or scaler is None):
@@ -246,6 +253,25 @@ class AdaptationTrainer:
                 "au_g_mean": float(guidance.mean()),
                 "au_g_std": float(guidance.std()),
             }
+        alignment_source_au, alignment_target_au = source_au, target_au
+        alignment_shuffle_metrics = {}
+        if self.config.au_alignment_enabled and self.config.au_alignment_mode == "shuffled":
+            source_p, source_changed = shuffle_valid_au(
+                source_au["au"],
+                source_au["au_valid"],
+                generator=self._alignment_shuffle_generator,
+            )
+            target_p, target_changed = shuffle_valid_au(
+                target_au["au"],
+                target_au["au_valid"],
+                generator=self._alignment_shuffle_generator,
+            )
+            alignment_source_au = {**source_au, "au": source_p}
+            alignment_target_au = {**target_au, "au": target_p}
+            valid_rows = int(source_au["au_valid"].sum() + target_au["au_valid"].sum())
+            alignment_shuffle_metrics["au_alignment_shuffled_ratio"] = (
+                (source_changed + target_changed) / valid_rows if valid_rows else 0.0
+            )
         if len(source_images) != len(target_images):
             raise ValueError("Paired source and target batches must have the same size")
         pseudo_labels, trusted_mask = self.supervision.lookup(list(sample_ids))
@@ -288,8 +314,8 @@ class AdaptationTrainer:
                 alignment = compute_au_alignment(
                     features.source_native_tokens,
                     features.target_native_tokens,
-                    source_au,
-                    target_au,
+                    alignment_source_au,
+                    alignment_target_au,
                     tau_mask=self.config.au_alignment_tau_mask,
                     n_eff_min=self.config.au_alignment_n_eff_min,
                     q_c=self.config.au_alignment_q_c,
@@ -333,6 +359,12 @@ class AdaptationTrainer:
                 alignment_metrics[f"au_alignment_target_weight_{index}"] = float(
                     alignment.target_weight_sums[index]
                 )
+                alignment_metrics[f"au_alignment_centroid_distance_{index}"] = float(
+                    alignment.distances[index]
+                )
+                alignment_metrics[f"au_alignment_loss_component_{index}"] = float(
+                    alignment.loss_components[index]
+                )
         return {
             "loss_total": float(total.detach()),
             "loss_in": float(loss_in.detach()),
@@ -348,6 +380,7 @@ class AdaptationTrainer:
             **getattr(self.adversarial_module, "last_metrics", {}),
             **au_metadata_metrics,
             **guidance_metrics,
+            **alignment_shuffle_metrics,
             **alignment_metrics,
             **getattr(getattr(self.model, "bcs_block1", None), "last_guidance_metrics", {}),
         }
@@ -380,7 +413,18 @@ class AdaptationTrainer:
                 sys.stdout.flush()
         if progress:
             sys.stdout.write("\n")
-        return {name: value / steps for name, value in totals.items()} | {"steps": steps}
+        result = {name: value / steps for name, value in totals.items()} | {"steps": steps}
+        component_names = [f"au_alignment_loss_component_{index}" for index in range(12)]
+        if any(name in totals for name in component_names):
+            component_total = sum(totals.get(name, 0.0) for name in component_names)
+            for index in range(12):
+                result[f"au_alignment_contribution_{index}"] = (
+                    totals.get(f"au_alignment_loss_component_{index}", 0.0)
+                    / component_total
+                    if component_total
+                    else 0.0
+                )
+        return result
 
     def run(self, on_epoch_end=None, *, progress=False):
         if self.supervision is None:
@@ -519,6 +563,7 @@ class AdaptationTrainer:
             "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "source_loader_generator_state": self._loader_generator_state(self.source_loader),
             "target_loader_generator_state": self._loader_generator_state(self.target_loader),
+            "alignment_shuffle_generator_state": self._alignment_shuffle_generator.get_state(),
         }
 
     def _boundary_checkpoint_path(self):
@@ -563,6 +608,8 @@ class AdaptationTrainer:
         saved_config.setdefault("au_g_scale", 1.0)
         saved_config.setdefault("au_lambda_learning_rate", 0.01)
         saved_config.setdefault("au_alignment_enabled", False)
+        saved_config.setdefault("seed", 42)
+        saved_config.setdefault("au_alignment_mode", "normal")
         saved_config.setdefault("au_alignment_tau_mask", None)
         saved_config.setdefault("au_alignment_n_eff_min", None)
         saved_config.setdefault("au_alignment_q_c", None)
@@ -612,6 +659,11 @@ class AdaptationTrainer:
         self._restore_loader_generator(
             self.target_loader, state["target_loader_generator_state"]
         )
+        alignment_rng_state = state.get("alignment_shuffle_generator_state")
+        if self.config.au_alignment_mode == "shuffled" and alignment_rng_state is None:
+            raise ValueError("Checkpoint is missing AU alignment shuffle RNG state")
+        if alignment_rng_state is not None:
+            self._alignment_shuffle_generator.set_state(alignment_rng_state.cpu())
         random.setstate(state["python_rng_state"])
         torch.set_rng_state(state["torch_rng_state"].cpu())
         if torch.cuda.is_available() and state["cuda_rng_state"] is not None:

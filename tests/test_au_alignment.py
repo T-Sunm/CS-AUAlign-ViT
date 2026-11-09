@@ -47,6 +47,8 @@ def test_row_major_region_pooling_and_intensity_weighted_centroids():
     assert result.target_region_features[:, 0, 0].tolist() == [17, 27]
     assert torch.allclose(result.target_centroids[0, 0], torch.tensor(24.5))
     assert torch.allclose(result.target_n_eff[0], torch.tensor(1.6))
+    assert torch.allclose(result.loss_components.sum(), result.loss)
+    assert result.distances.shape == result.loss_components.shape == (12,)
     result.loss.backward()
     assert source_tokens.grad is not None and torch.count_nonzero(source_tokens.grad)
 

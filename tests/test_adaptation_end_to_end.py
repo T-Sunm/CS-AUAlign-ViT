@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import pytest
 import yaml
 from str_helpers import TinyImageModel, make_source, make_target
 
@@ -34,6 +35,36 @@ def test_auto_output_numbers_runs_and_resume_uses_checkpoint_directory(tmp_path)
     assert first == parent / "run-001"
     assert second == parent / "run-002"
     assert train_adaptation.resolve_output(None, first / "adaptation.pt") == first
+
+
+def test_run_files_keep_original_au_cache_immutable(tmp_path):
+    train_adaptation = load_script("train_adaptation")
+    output = tmp_path / "run"
+    output.mkdir()
+    original = tmp_path / "raf.csv"
+    original.write_text("sample_id,status\n")
+    config = {"training": {"seed": 42}}
+
+    working = train_adaptation.prepare_run_files(output, config, original)
+    working.write_text("changed")
+
+    assert original.read_text() == "sample_id,status\n"
+    assert train_adaptation.prepare_run_files(output, config, original, resume=True) == working
+    with pytest.raises(ValueError, match="Resolved adaptation configuration"):
+        train_adaptation.prepare_run_files(output, {"training": {"seed": 7}}, original, resume=True)
+
+
+def test_ablation_configs_validate():
+    train_adaptation = load_script("train_adaptation")
+    root = Path(__file__).parents[1] / "configs" / "training" / "ablation"
+
+    for config_path in sorted(root.glob("*.yaml")):
+        config = train_adaptation.validate_config(yaml.safe_load(config_path.read_text()))
+        assert config["au_guidance"]["mode"] in {
+            "off",
+            "dynamic",
+            "dynamic_shuffled",
+        }
 
 
 def test_source_checkpoint_to_adaptation_resume_and_evaluation(tmp_path, monkeypatch, capsys):
