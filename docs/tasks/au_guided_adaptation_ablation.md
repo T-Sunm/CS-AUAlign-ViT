@@ -32,11 +32,15 @@ checkpoint bằng ExpW validation theo cách hiện tại, sau đó đánh giá 
 ExpW validation; adaptation training không dùng target labels. ExpW test không
 được dùng để chỉnh cấu hình hoặc chọn checkpoint.
 
-AU attention dùng cấu hình đã khóa ở Task 7. AU alignment dùng các giá trị
-`tau_mask`, `n_eff_min`, `q_c` và `eta` trong
+AU attention dùng `g_scale=3000000.0` và learning rate của `λ=0.000001`, đã
+khóa từ pilot Task 7. E1, E3 và E5 dùng cùng hai giá trị này. AU alignment
+dùng `tau_mask=1.0`, `n_eff_min=8`, `eta=0.0008634870173409581` và 12 giá trị
+`q_c` trong
 [`adaptation.yaml`](../../configs/training/adaptation.yaml). Cơ sở calibration
 nằm trong [`au_alignment_calibration.md`](../../reports/au_alignment_calibration.md).
-Không calibration lại các giá trị này giữa các experiment.
+Không calibration lại các giá trị này giữa các experiment. AU attention pilot
+không dùng ExpW validation hoặc test accuracy; kết quả được lưu tại
+[`au-attention-pilot-matrix/report.md`](../../runs/adaptation/au-attention-pilot-matrix/report.md).
 
 Kết quả và artifact của ablation được tổng hợp tại
 [`au_alignment_ablation.md`](../experiments/au_alignment_ablation.md). E0 hiện

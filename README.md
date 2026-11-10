@@ -45,3 +45,29 @@ guidance or AU alignment is enabled, also pass `--source-au-cache` and
 `--target-au-cache` pointing to the corresponding Task 7 CSV caches. The AU
 alignment calibration notebook is
 [`notebooks/au_alignment_calibration.ipynb`](notebooks/au_alignment_calibration.ipynb).
+
+Audit the landmarks and LibreFace AU guidance generated after STR with
+[`notebooks/audit_str_au_landmarks.ipynb`](notebooks/audit_str_au_landmarks.ipynb).
+It reads the E3 artifacts directly from
+`runs/adaptation/e3-both-100epochs-seed42/str/manifest.jsonl` and
+`runs/adaptation/e3-both-100epochs-seed42/source_au_cache.csv`, samples up to
+150 STR images, compares donor-inherited landmarks with a fresh MTCNN detection,
+and writes `audit_results.csv` plus `review_queue.csv` under `str/audit/`.
+
+Install the development dependencies and register the project environment as a
+kernel once:
+
+```bash
+uv sync --python 3.12 --group dev
+uv run --python 3.12 --group dev python -m ipykernel install --user \
+  --name cs-aualign-vite --display-name "CS-AUAlign-ViT"
+```
+
+Then open the notebook with the VS Code Jupyter extension and select the
+`cs-aualign-vite` kernel. JupyterLab is not required.
+
+The ExpW evaluation manifest remains
+`/home/hung/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl`
+on the data host. The STR audit does not load it because the committed STR
+manifest already contains the image path, donor provenance, and inherited
+landmarks.

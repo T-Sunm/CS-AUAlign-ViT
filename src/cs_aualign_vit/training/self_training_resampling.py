@@ -69,7 +69,7 @@ class SelfTrainingResampler:
         self.num_classes = num_classes
         self.confidence_threshold = confidence_threshold
         self.au_cache = Path(au_cache).resolve() if au_cache is not None else None
-        self.au_python = Path(au_python).resolve() if au_python is not None else None
+        self.au_python = Path(au_python).absolute() if au_python is not None else None
         if (self.au_cache is None) != (self.au_python is None):
             raise ValueError("au_cache and au_python must be configured together")
         if self.au_python is not None and not self.au_python.is_file():

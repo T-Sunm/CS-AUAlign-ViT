@@ -86,6 +86,45 @@ softmax bão hòa, tối đa `5%` số hàng được chuyển từ
 chúng trước ablation. Nếu không đạt một trong hai cận, chỉnh pilot rồi đo
 lại trước khi chạy ablation.
 
+### 3.1. Pilot và cấu hình đã khóa
+
+Ma trận calibration cuối dùng cấu hình E3, tức attention và alignment cùng
+bật; alignment giữ nguyên các giá trị đã khóa ở Task 8.1. Pilot chạy từ cùng
+source checkpoint, seed 42, batch size 16 và 100 optimizer step cho mỗi cấu
+hình. Sau mỗi run, checkpoint được đo trên 768 batch train cố định. Một cặp
+được tính là mạnh khi `max(p_s) >= 0.5` và `max(p_t) >= 0.5`. Một cấu hình đạt
+khi P90 của `D` từ hai chiều đều không thấp hơn `0.01`, tỷ lệ saturation không
+vượt `5%`, có ít nhất 20 cặp AU mạnh và AMP bỏ qua không quá `5%` số step.
+ExpW validation và test không tham gia lựa chọn.
+
+| Run | `g_scale` | Learning rate của `λ` | P90 t→s / s→t | Saturation t→s / s→t | AMP skip | Kết quả |
+|---|---:|---:|---:|---:|---:|---|
+| A | `3e6` | `1e-6` | `0.0232 / 0.0374` | `0.84% / 2.68%` | `3/100` | Đạt |
+| B | `3e6` | `3e-6` | `0.0516 / 0.0885` | `2.81% / 5.58%` | `3/100` | Không đạt saturation s→t |
+| C | `3e6` | `1e-5` | `0.1189 / 0.1468` | `6.82% / 6.77%` | `2/100` | Không đạt saturation |
+| D | `1e7` | `9e-7` | `0.1460 / 0.1599` | `9.02% / 8.75%` | `2/100` | Không đạt saturation |
+
+Mỗi phép đo có 5.459 cặp hợp lệ, trong đó 26 cặp đạt điều kiện AU mạnh. Run
+A là cấu hình duy nhất đạt toàn bộ điều kiện, nên Task 7 khóa:
+
+```yaml
+au_guidance:
+  g_scale: 3000000.0
+  lambda_learning_rate: 0.000001
+```
+
+Smoke một epoch với cấu hình A tiếp tục đạt hai cận: P90 là `0.0551 / 0.0846`
+và saturation là `1.72% / 3.74%`. Loss, feature và parameters hữu hạn trong
+suốt run. E1, E3 và E5 phải dùng cùng hai giá trị trên; không calibration lại
+theo validation accuracy của từng experiment.
+
+Quy trình nằm trong
+[`pilot_au_attention_training.py`](../../scripts/pilot_au_attention_training.py),
+[`calibrate_au_attention.py`](../../scripts/calibrate_au_attention.py) và
+[`run_au_attention_pilot_matrix.py`](../../scripts/run_au_attention_pilot_matrix.py).
+Bảng kết quả đầy đủ được lưu tại
+[`au-attention-pilot-matrix/report.md`](../../runs/adaptation/au-attention-pilot-matrix/report.md).
+
 ## 4. Ba mode và tích hợp train
 
 | Mode | Hành vi |

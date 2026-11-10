@@ -1,0 +1,1 @@
+- Prefers managing Python environments and installing dependencies with `uv` (e.g. `uv sync --python 3.12 --group dev`, `uv run --python 3.12 ...`) rather than raw pip. Confidence: 0.6

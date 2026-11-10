@@ -6,6 +6,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "facenet-pytorch>=2.6.0",
     "numpy>=1.26,<2",
     "Pillow>=10.2,<10.3",
     "PyYAML>=6,<7",
@@ -17,7 +18,14 @@ dependencies = [
 preprocess = ["facenet-pytorch==2.6.0"]
 
 [dependency-groups]
-dev = ["pytest>=8,<9", "ruff>=0.11,<1"]
+dev = [
+    "ipykernel>=7.4.0",
+    "matplotlib>=3.11.2",
+    "pandas>=2.3.3",
+    "pillow>=10.2.0",
+    "pytest>=8,<9",
+    "ruff>=0.11,<1",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
