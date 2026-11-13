@@ -218,6 +218,10 @@ runs/
 tmp/
 notebooks/tmp/
 
+# Offline AU heatmap tool artifacts
+tools/au_heatmap/checkpoints/
+tools/au_heatmap/results/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

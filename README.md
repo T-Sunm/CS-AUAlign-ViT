@@ -1,5 +1,8 @@
 # CS-AUAlign-ViT
 
+The standalone 12-AU heatmap extractor is documented in
+[`tools/au_heatmap/README.md`](tools/au_heatmap/README.md).
+
 Research implementation progressing from POST–Swin to POST-style ViT and
 AU-guided cross-domain adaptation. Source pretraining fine-tunes ImageNet
 Swin-Tiny on RAF-DB while learning a seven-class prototype bank.
