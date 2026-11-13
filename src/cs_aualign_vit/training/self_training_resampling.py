@@ -48,6 +48,11 @@ class SelfTrainingResampler:
         confidence_threshold=0.95,
         au_cache=None,
         au_python=None,
+        spatial_cache=None,
+        spatial_mode="landmark",
+        heatmap_python=None,
+        heatmap_checkpoint=None,
+        peak_threshold=0.8,
     ):
         dataset = target_feature_loader.dataset
         if not isinstance(dataset, FaceDataset) or dataset.role != "target_features":
@@ -74,6 +79,36 @@ class SelfTrainingResampler:
             raise ValueError("au_cache and au_python must be configured together")
         if self.au_python is not None and not self.au_python.is_file():
             raise FileNotFoundError(f"LibreFace Python executable not found: {self.au_python}")
+        if spatial_mode not in {"landmark", "heatmap"}:
+            raise ValueError("spatial_mode must be landmark or heatmap")
+        if peak_threshold < 0:
+            raise ValueError("peak_threshold must be non-negative")
+        self.spatial_mode = spatial_mode
+        self.peak_threshold = float(peak_threshold)
+        self.spatial_cache = (
+            Path(spatial_cache).resolve() if spatial_cache is not None else None
+        )
+        self.heatmap_python = (
+            Path(heatmap_python).absolute() if heatmap_python is not None else None
+        )
+        self.heatmap_checkpoint = (
+            Path(heatmap_checkpoint).resolve() if heatmap_checkpoint is not None else None
+        )
+        heatmap_values = (
+            self.spatial_cache,
+            self.heatmap_python,
+            self.heatmap_checkpoint,
+        )
+        if self.spatial_mode == "heatmap" and any(value is None for value in heatmap_values):
+            raise ValueError("Heatmap STR requires cache, Python executable, and checkpoint")
+        if self.spatial_mode == "landmark" and any(value is not None for value in heatmap_values):
+            raise ValueError("Heatmap STR options require spatial_mode=heatmap")
+        if self.heatmap_python is not None and not self.heatmap_python.is_file():
+            raise FileNotFoundError(
+                f"Heatmap Python executable not found: {self.heatmap_python}"
+            )
+        if self.heatmap_checkpoint is not None and not self.heatmap_checkpoint.is_file():
+            raise FileNotFoundError(f"Heatmap checkpoint not found: {self.heatmap_checkpoint}")
         source = FaceDataset(self.source_manifest, "source_train")
         usable = {s["sample_id"] for s in source.samples}
         self._donors = {c: [] for c in range(num_classes)}
@@ -90,6 +125,8 @@ class SelfTrainingResampler:
             "global_seed": self.global_seed,
             "confidence_threshold": self.confidence_threshold,
             "num_classes": self.num_classes,
+            "spatial_mode": self.spatial_mode,
+            "peak_threshold": self.peak_threshold,
         }
 
     def _validate_transaction_config(self, transaction):
@@ -254,6 +291,27 @@ class SelfTrainingResampler:
                 ],
                 check=True,
             )
+        if self.spatial_cache is not None and created:
+            extractor = (
+                Path(__file__).resolve().parents[3]
+                / "scripts"
+                / "extract_au_heatmap_cache.py"
+            )
+            subprocess.run(
+                [
+                    str(self.heatmap_python),
+                    str(extractor),
+                    "--manifest",
+                    str(self.manifest_path),
+                    "--output",
+                    str(self.spatial_cache),
+                    "--checkpoint",
+                    str(self.heatmap_checkpoint),
+                    "--peak-threshold",
+                    str(self.peak_threshold),
+                ],
+                check=True,
+            )
         counts_after = self._counts(rows)
         completed = {
             **transaction,
@@ -321,4 +379,7 @@ class SelfTrainingResampler:
             num_workers=self.num_workers,
             transform=source_transform,
             au_cache=self.au_cache,
+            spatial_cache=self.spatial_cache,
+            spatial_mode=self.spatial_mode,
+            peak_threshold=self.peak_threshold,
         )

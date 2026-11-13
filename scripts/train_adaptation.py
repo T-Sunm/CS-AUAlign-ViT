@@ -31,6 +31,16 @@ def parse_args():
     parser.add_argument("--source-au-cache", type=Path)
     parser.add_argument("--target-au-cache", type=Path)
     parser.add_argument("--au-python", type=Path, default=Path(".venv-au/bin/python"))
+    parser.add_argument("--source-heatmap-cache", type=Path)
+    parser.add_argument("--target-heatmap-cache", type=Path)
+    parser.add_argument(
+        "--heatmap-python", type=Path, default=Path("tools/au_heatmap/.venv/bin/python")
+    )
+    parser.add_argument(
+        "--heatmap-checkpoint",
+        type=Path,
+        default=Path("tools/au_heatmap/checkpoints/disfa_adaptation_f0.pth"),
+    )
     return parser.parse_args()
 
 
@@ -53,6 +63,7 @@ def validate_config(config):
             "eta": None,
         },
     )
+    config.setdefault("au_spatial", {"mode": "landmark", "peak_threshold": 0.8})
     sections = (
         "training",
         "loss",
@@ -61,6 +72,7 @@ def validate_config(config):
         "preprocessing",
         "au_guidance",
         "au_alignment",
+        "au_spatial",
     )
     if any(not isinstance(config.get(section), dict) for section in sections):
         raise ValueError("Incomplete adaptation configuration")
@@ -95,6 +107,7 @@ def validate_config(config):
             "r_target",
             "eta",
         },
+        "au_spatial": {"mode", "peak_threshold"},
     }
     if any(required[name] - config[name].keys() for name in required):
         raise ValueError("Incomplete adaptation configuration")
@@ -131,6 +144,13 @@ def validate_config(config):
             )
         ):
             raise ValueError("Enabled AU alignment requires 12 non-negative q_c values")
+    spatial = config["au_spatial"]
+    if spatial["mode"] not in {"landmark", "heatmap"}:
+        raise ValueError("au_spatial.mode must be landmark or heatmap")
+    if not isinstance(spatial["peak_threshold"], (int, float)) or not np.isfinite(
+        spatial["peak_threshold"]
+    ) or spatial["peak_threshold"] < 0:
+        raise ValueError("au_spatial.peak_threshold must be finite and non-negative")
     return config
 
 
@@ -175,6 +195,21 @@ def prepare_run_files(output, config, source_au_cache=None, *, resume=False):
     return working_cache
 
 
+def prepare_spatial_run_cache(output, source_cache=None, *, resume=False):
+    """Isolate the mutable source heatmap cache used by STR."""
+    if source_cache is None:
+        return None
+    working_cache = output / "source_heatmap_cache"
+    if resume:
+        if not working_cache.is_dir():
+            raise FileNotFoundError(f"Run source heatmap cache is missing: {working_cache}")
+    else:
+        if working_cache.exists():
+            raise FileExistsError(f"Run source heatmap cache already exists: {working_cache}")
+        shutil.copytree(source_cache, working_cache)
+    return working_cache
+
+
 def run(args):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     config = validate_config(yaml.safe_load(args.config.read_text()))
@@ -194,6 +229,7 @@ def run(args):
     preprocessing = config["preprocessing"]
     guidance = config["au_guidance"]
     alignment = config["au_alignment"]
+    spatial = config["au_spatial"]
     guidance_enabled = guidance["mode"] != "off"
     au_enabled = guidance_enabled or alignment["enabled"]
     original_source_au_cache = getattr(args, "source_au_cache", None)
@@ -201,11 +237,38 @@ def run(args):
     au_python = getattr(args, "au_python", Path(".venv-au/bin/python"))
     if au_enabled and (original_source_au_cache is None or target_au_cache is None):
         raise ValueError("AU modes require --source-au-cache and --target-au-cache")
+    heatmap_enabled = spatial["mode"] == "heatmap"
+    original_source_spatial_cache = getattr(args, "source_heatmap_cache", None)
+    target_spatial_cache = getattr(args, "target_heatmap_cache", None)
+    heatmap_python = getattr(
+        args, "heatmap_python", Path("tools/au_heatmap/.venv/bin/python")
+    )
+    heatmap_checkpoint = getattr(
+        args,
+        "heatmap_checkpoint",
+        Path("tools/au_heatmap/checkpoints/disfa_adaptation_f0.pth"),
+    )
+    if heatmap_enabled and not au_enabled:
+        raise ValueError("Heatmap spatial guidance requires AU guidance or AU alignment")
+    if heatmap_enabled and (
+        original_source_spatial_cache is None or target_spatial_cache is None
+    ):
+        raise ValueError(
+            "Heatmap spatial guidance requires --source-heatmap-cache and "
+            "--target-heatmap-cache"
+        )
+    if heatmap_enabled and (not heatmap_python.is_file() or not heatmap_checkpoint.is_file()):
+        raise FileNotFoundError("Heatmap Python executable or checkpoint is missing")
     output = resolve_output(args.output, args.resume)
     source_au_cache = prepare_run_files(
         output,
         config,
         original_source_au_cache if au_enabled else None,
+        resume=args.resume is not None,
+    )
+    source_spatial_cache = prepare_spatial_run_cache(
+        output,
+        original_source_spatial_cache if heatmap_enabled else None,
         resume=args.resume is not None,
     )
     LOGGER.info("adaptation output: %s", output)
@@ -222,6 +285,9 @@ def run(args):
         [args.source_manifest],
         drop_last=True,
         au_cache=source_au_cache if au_enabled else None,
+        spatial_cache=source_spatial_cache if heatmap_enabled else None,
+        spatial_mode=spatial["mode"],
+        peak_threshold=spatial["peak_threshold"],
         **loader_options,
     )
     target_loader = build_loader(
@@ -229,6 +295,9 @@ def run(args):
         "target_adaptation",
         drop_last=True,
         au_cache=target_au_cache if au_enabled else None,
+        spatial_cache=target_spatial_cache if heatmap_enabled else None,
+        spatial_mode=spatial["mode"],
+        peak_threshold=spatial["peak_threshold"],
         **loader_options,
     )
     target_feature_loader = build_loader(args.target_manifest, "target_features", **loader_options)
@@ -301,6 +370,8 @@ def run(args):
         au_alignment_epsilon_weight=alignment["epsilon_weight"],
         au_alignment_r_target=alignment["r_target"],
         au_alignment_eta=alignment["eta"],
+        au_spatial_mode=spatial["mode"],
+        au_spatial_peak_threshold=spatial["peak_threshold"],
         **config["loss"],
     )
     resampler = SelfTrainingResampler(
@@ -316,6 +387,11 @@ def run(args):
         confidence_threshold=config["str"]["confidence_threshold"],
         au_cache=source_au_cache if au_enabled else None,
         au_python=au_python if au_enabled else None,
+        spatial_cache=source_spatial_cache if heatmap_enabled else None,
+        spatial_mode=spatial["mode"],
+        heatmap_python=heatmap_python if heatmap_enabled else None,
+        heatmap_checkpoint=heatmap_checkpoint if heatmap_enabled else None,
+        peak_threshold=spatial["peak_threshold"],
     )
     trainer = AdaptationTrainer(
         model=model,
@@ -335,6 +411,8 @@ def run(args):
         source_checkpoint=args.source_checkpoint,
         source_au_cache=source_au_cache if au_enabled else None,
         target_au_cache=target_au_cache if au_enabled else None,
+        source_spatial_cache=source_spatial_cache if heatmap_enabled else None,
+        target_spatial_cache=target_spatial_cache if heatmap_enabled else None,
     )
     if args.resume:
         trainer.load_checkpoint()

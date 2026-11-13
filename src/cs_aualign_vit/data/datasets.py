@@ -5,13 +5,22 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
-from .au_guidance import AUCache, build_au_mask
+from .au_guidance import AUCache, AUSpatialCache, build_au_mask
 from .manifests import read_jsonl, validate_rows
 from .transforms import GuidanceTransform, build_transform
 
 
 class FaceDataset(Dataset):
-    def __init__(self, manifest, role, split=None, transform=None, au_cache=None):
+    def __init__(
+        self,
+        manifest,
+        role,
+        split=None,
+        transform=None,
+        au_cache=None,
+        spatial_cache=None,
+        spatial_mode="landmark",
+    ):
         allowed = {"source_train", "target_adaptation", "target_features", "evaluation"}
         if role not in allowed:
             raise ValueError(f"role must be one of {sorted(allowed)}")
@@ -37,6 +46,14 @@ class FaceDataset(Dataset):
                 raise ValueError("Evaluation requires validation/test")
         self.role = role
         self.au_cache = au_cache
+        self.spatial_cache = spatial_cache
+        self.spatial_mode = spatial_mode
+        if spatial_mode not in {"landmark", "heatmap"}:
+            raise ValueError("spatial_mode must be landmark or heatmap")
+        if spatial_mode == "heatmap" and spatial_cache is None:
+            raise ValueError("heatmap spatial mode requires a spatial cache")
+        if spatial_cache is not None:
+            spatial_cache.validate_manifest(manifest)
         self.transform = transform or build_transform(role in {"source_train", "target_adaptation"})
         self.samples = []
         for row in rows:
@@ -70,7 +87,13 @@ class FaceDataset(Dataset):
                 tensor = self.transform(image)
                 guidance = None
             else:
-                mask, landmark_valid = build_au_mask(record["landmarks_crop"], image.size)
+                landmark_mask, landmark_valid = build_au_mask(
+                    record["landmarks_crop"], image.size
+                )
+                if self.spatial_mode == "heatmap":
+                    mask, heatmap_valid = self.spatial_cache.get(record["sample_id"])
+                else:
+                    mask, heatmap_valid = landmark_mask, True
                 tensor, mask = self.transform(image, mask)
                 au, au_valid = self.au_cache.get(record["sample_id"])
                 guidance = {
@@ -78,6 +101,8 @@ class FaceDataset(Dataset):
                     "mask": mask,
                     "au_valid": au_valid,
                     "landmark_valid": landmark_valid,
+                    "heatmap_valid": heatmap_valid,
+                    "spatial_valid": landmark_valid and heatmap_valid,
                 }
         identity = (
             record["sample_id"]
@@ -106,6 +131,9 @@ def build_loader(
     std=(0.229, 0.224, 0.225),
     drop_last=False,
     au_cache=None,
+    spatial_cache=None,
+    spatial_mode="landmark",
+    peak_threshold=0.8,
 ):
     import torch
 
@@ -120,6 +148,17 @@ def build_loader(
     )
     if cache is not None and role not in {"source_train", "target_adaptation"}:
         raise ValueError("AU cache is only supported by paired training loaders")
+    spatial = (
+        AUSpatialCache(
+            spatial_cache,
+            manifest=manifest,
+            peak_threshold=peak_threshold,
+        )
+        if spatial_cache is not None and not isinstance(spatial_cache, AUSpatialCache)
+        else spatial_cache
+    )
+    if spatial is not None and cache is None:
+        raise ValueError("Spatial cache requires an AU cache")
     transform = (
         GuidanceTransform(image_size, mean, std)
         if cache is not None and role in {"source_train", "target_adaptation"}
@@ -131,6 +170,8 @@ def build_loader(
         split,
         transform,
         cache,
+        spatial,
+        spatial_mode,
     )
     generator = torch.Generator().manual_seed(seed)
     return DataLoader(
@@ -156,6 +197,9 @@ def build_source_loader(
     std=(0.229, 0.224, 0.225),
     transform=None,
     au_cache=None,
+    spatial_cache=None,
+    spatial_mode="landmark",
+    peak_threshold=0.8,
 ):
     """Shuffled source loader over the original manifest plus any non-empty STR manifests.
 
@@ -173,15 +217,40 @@ def build_source_loader(
         if au_cache is not None and not isinstance(au_cache, AUCache)
         else au_cache
     )
+    spatial = (
+        AUSpatialCache(spatial_cache, peak_threshold=peak_threshold)
+        if spatial_cache is not None and not isinstance(spatial_cache, AUSpatialCache)
+        else spatial_cache
+    )
+    if spatial is not None and cache is None:
+        raise ValueError("Spatial cache requires an AU cache")
     transform = transform or (
         GuidanceTransform(image_size, mean, std)
         if cache is not None
         else build_transform(True, image_size, mean, std)
     )
-    datasets = [FaceDataset(manifests[0], "source_train", transform=transform, au_cache=cache)]
+    datasets = [
+        FaceDataset(
+            manifests[0],
+            "source_train",
+            transform=transform,
+            au_cache=cache,
+            spatial_cache=spatial,
+            spatial_mode=spatial_mode,
+        )
+    ]
     for extra in manifests[1:]:
         if extra.exists() and extra.stat().st_size and read_jsonl(extra):
-            datasets.append(FaceDataset(extra, "source_train", transform=transform, au_cache=cache))
+            datasets.append(
+                FaceDataset(
+                    extra,
+                    "source_train",
+                    transform=transform,
+                    au_cache=cache,
+                    spatial_cache=spatial,
+                    spatial_mode=spatial_mode,
+                )
+            )
     return DataLoader(
         ConcatDataset(datasets),
         batch_size=batch_size,

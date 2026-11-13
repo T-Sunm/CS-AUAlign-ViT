@@ -9,7 +9,7 @@ training:
   device: cuda:0
   amp: true
   kmeans_interval: 10
-  str_epochs: [25, 50, 75]
+  str_epochs: []
 loss:
   alpha: 1.0
   beta: 0.5

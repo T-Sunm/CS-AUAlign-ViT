@@ -29,7 +29,7 @@ def load_model(ckpt_path, device="cpu"):
 
 def preprocess(face_rgb_uint8):
     """HxWx3 uint8 RGB face crop -> 1x3x256x256 float in [0,1] (min-max, as in the original code)."""
-    t = torch.from_numpy(np.ascontiguousarray(face_rgb_uint8)).permute(2, 0, 1).float()[None]
+    t = torch.from_numpy(np.array(face_rgb_uint8, copy=True, order="C")).permute(2, 0, 1).float()[None]
     t = F.interpolate(t, size=(256, 256), mode="bilinear", align_corners=False)
     t = (t - t.min()) / (t.max() - t.min() + 1e-8)
     return t

@@ -11,7 +11,11 @@ from pathlib import Path
 import torch
 from torch.utils.data import ConcatDataset
 
-from cs_aualign_vit.data.au_guidance import compute_guidance, shuffle_valid_au
+from cs_aualign_vit.data.au_guidance import (
+    compute_guidance,
+    shuffle_valid_au,
+    spatial_cache_identity,
+)
 from cs_aualign_vit.data.manifests import CLASSES, sha256
 from cs_aualign_vit.training.au_alignment import compute_au_alignment
 from cs_aualign_vit.training.prototype_learning import compute_prototype_losses
@@ -47,6 +51,8 @@ class AdaptationConfig:
     au_alignment_epsilon_weight: float = 1.0e-8
     au_alignment_r_target: float = 0.1
     au_alignment_eta: float | None = None
+    au_spatial_mode: str = "landmark"
+    au_spatial_peak_threshold: float = 0.8
 
     def __post_init__(self):
         if self.max_epochs < 1 or self.kmeans_interval < 1 or self.num_classes < 1:
@@ -63,6 +69,10 @@ class AdaptationConfig:
             raise ValueError("au_alignment_enabled must be boolean")
         if self.au_alignment_mode not in {"normal", "shuffled"}:
             raise ValueError("au_alignment_mode must be normal or shuffled")
+        if self.au_spatial_mode not in {"landmark", "heatmap"}:
+            raise ValueError("au_spatial_mode must be landmark or heatmap")
+        if self.au_spatial_peak_threshold < 0:
+            raise ValueError("au_spatial_peak_threshold must be non-negative")
         if self.au_alignment_epsilon <= 0 or self.au_alignment_epsilon_weight < 0:
             raise ValueError("AU alignment epsilons are invalid")
         if self.au_alignment_r_target <= 0:
@@ -107,6 +117,8 @@ class AdaptationTrainer:
         source_checkpoint=None,
         source_au_cache=None,
         target_au_cache=None,
+        source_spatial_cache=None,
+        target_spatial_cache=None,
     ):
         self.model = model
         self.prototype_banks = prototype_banks
@@ -130,6 +142,12 @@ class AdaptationTrainer:
         self.source_checkpoint = str(source_checkpoint) if source_checkpoint is not None else None
         self.source_au_cache = Path(source_au_cache).resolve() if source_au_cache else None
         self.target_au_cache = Path(target_au_cache).resolve() if target_au_cache else None
+        self.source_spatial_cache = (
+            Path(source_spatial_cache).resolve() if source_spatial_cache else None
+        )
+        self.target_spatial_cache = (
+            Path(target_spatial_cache).resolve() if target_spatial_cache else None
+        )
         self.supervision = None
         self.completed_epoch = 0
         self.global_step = 0
@@ -156,6 +174,14 @@ class AdaptationTrainer:
             self.source_au_cache is None or self.target_au_cache is None
         ):
             raise ValueError("AU cache paths are required when AU features are enabled")
+        if config.au_spatial_mode == "heatmap" and (
+            config.au_mode == "off" and not config.au_alignment_enabled
+        ):
+            raise ValueError("Heatmap spatial guidance requires an enabled AU feature")
+        if config.au_spatial_mode == "heatmap" and (
+            self.source_spatial_cache is None or self.target_spatial_cache is None
+        ):
+            raise ValueError("Spatial cache paths are required for heatmap guidance")
 
         self.model.to(self.device)
         self.prototype_banks.to(self.device)
@@ -210,8 +236,20 @@ class AdaptationTrainer:
         else:
             source_images, source_labels, source_au = source_batch
             target_images, sample_ids, target_au = target_batch
-        au_metadata_metrics = (
-            {
+        if needs_au:
+            source_spatial_valid = source_au.get(
+                "spatial_valid", source_au["landmark_valid"]
+            )
+            target_spatial_valid = target_au.get(
+                "spatial_valid", target_au["landmark_valid"]
+            )
+            source_heatmap_valid = source_au.get(
+                "heatmap_valid", torch.ones_like(source_au["landmark_valid"])
+            )
+            target_heatmap_valid = target_au.get(
+                "heatmap_valid", torch.ones_like(target_au["landmark_valid"])
+            )
+            au_metadata_metrics = {
                 "au_source_missing_ratio": float((~source_au["au_valid"]).float().mean()),
                 "au_target_missing_ratio": float((~target_au["au_valid"]).float().mean()),
                 "au_source_landmark_missing_ratio": float(
@@ -220,10 +258,22 @@ class AdaptationTrainer:
                 "au_target_landmark_missing_ratio": float(
                     (~target_au["landmark_valid"]).float().mean()
                 ),
+                "au_source_heatmap_missing_ratio": float(
+                    (~source_heatmap_valid).float().mean()
+                ),
+                "au_target_heatmap_missing_ratio": float(
+                    (~target_heatmap_valid).float().mean()
+                ),
+                "au_source_spatial_missing_ratio": float(
+                    (~source_spatial_valid).float().mean()
+                ),
+                "au_target_spatial_missing_ratio": float(
+                    (~target_spatial_valid).float().mean()
+                ),
             }
-            if needs_au
-            else {}
-        )
+        else:
+            source_spatial_valid = target_spatial_valid = None
+            au_metadata_metrics = {}
         if self.config.au_mode == "off":
             guidance = None
             guidance_metrics = {}
@@ -236,9 +286,9 @@ class AdaptationTrainer:
                 shuffled = source_changed + target_changed
             valid_pairs = (
                 source_au["au_valid"]
-                & source_au["landmark_valid"]
+                & source_spatial_valid
                 & target_au["au_valid"]
-                & target_au["landmark_valid"]
+                & target_spatial_valid
             )
             guidance = compute_guidance(
                 target_p,
@@ -552,6 +602,14 @@ class AdaptationTrainer:
                 if self.config.au_mode != "off" or self.config.au_alignment_enabled
                 else None
             ),
+            "spatial_cache_identity": (
+                {
+                    "source": spatial_cache_identity(self.source_spatial_cache),
+                    "target": spatial_cache_identity(self.target_spatial_cache),
+                }
+                if self.config.au_spatial_mode == "heatmap"
+                else None
+            ),
             "boundary_completed": self.boundary_completed,
             "expected_str_round_id": (
                 self._round_id(self.completed_epoch)
@@ -617,6 +675,8 @@ class AdaptationTrainer:
         saved_config.setdefault("au_alignment_epsilon_weight", 1.0e-8)
         saved_config.setdefault("au_alignment_r_target", 0.1)
         saved_config.setdefault("au_alignment_eta", None)
+        saved_config.setdefault("au_spatial_mode", "landmark")
+        saved_config.setdefault("au_spatial_peak_threshold", 0.8)
         if saved_config != asdict(self.config):
             raise ValueError("Saved adaptation configuration differs from the current run")
         expected_au_identity = (
@@ -632,6 +692,19 @@ class AdaptationTrainer:
             and state.get("au_cache_identity") != expected_au_identity
         ):
             raise ValueError("Saved AU caches differ from the current run")
+        expected_spatial_identity = (
+            {
+                "source": spatial_cache_identity(self.source_spatial_cache),
+                "target": spatial_cache_identity(self.target_spatial_cache),
+            }
+            if self.config.au_spatial_mode == "heatmap"
+            else None
+        )
+        if (
+            state.get("boundary_completed")
+            and state.get("spatial_cache_identity") != expected_spatial_identity
+        ):
+            raise ValueError("Saved spatial caches differ from the current run")
         if state.get("class_mapping") != list(CLASSES[: self.config.num_classes]):
             raise ValueError("Saved class mapping differs from the current run")
         if state.get("feature_dim") != self.prototype_banks.source_prototypes.shape[1]:

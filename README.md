@@ -38,7 +38,7 @@ Resume the current RAF-DB → ExpW adaptation run with:
 ```bash
 uv run --python 3.12 python scripts/train_adaptation.py \
   --source-manifest data/processed/raf-v5-deduplicated/processed.jsonl \
-  --target-manifest /home/hung/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --target-manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
   --source-checkpoint runs/source-pretraining-val/best.pt \
   --resume runs/adaptation/run-001/adaptation.pt
 ```
@@ -48,6 +48,31 @@ guidance or AU alignment is enabled, also pass `--source-au-cache` and
 `--target-au-cache` pointing to the corresponding Task 7 CSV caches. The AU
 alignment calibration notebook is
 [`notebooks/au_alignment_calibration.ipynb`](notebooks/au_alignment_calibration.ipynb).
+
+Evaluate the completed E1, E2 and E4 ablations on the frozen ExpW test split:
+
+```bash
+uv run --python 3.12 python scripts/evaluate_adaptation.py \
+  --manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --checkpoint runs/adaptation/e1_attention-100epochs-seed42-bs45/best.pt \
+  --split test \
+  --device cuda:0 \
+  --output runs/adaptation/e1_attention-100epochs-seed42-bs45/expw_test.json
+
+uv run --python 3.12 python scripts/evaluate_adaptation.py \
+  --manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --checkpoint runs/adaptation/e2_alignment-100epochs-seed42-bs45/best.pt \
+  --split test \
+  --device cuda:0 \
+  --output runs/adaptation/e2_alignment-100epochs-seed42-bs45/expw_test.json
+
+uv run --python 3.12 python scripts/evaluate_adaptation.py \
+  --manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --checkpoint runs/adaptation/e4_alignment_shuffled-100epochs-seed42-bs64/best.pt \
+  --split test \
+  --device cuda:0 \
+  --output runs/adaptation/e4_alignment_shuffled-100epochs-seed42-bs64/expw_test.json
+```
 
 Audit the landmarks and LibreFace AU guidance generated after STR with
 [`notebooks/audit_str_au_landmarks.ipynb`](notebooks/audit_str_au_landmarks.ipynb).
@@ -70,7 +95,7 @@ Then open the notebook with the VS Code Jupyter extension and select the
 `cs-aualign-vite` kernel. JupyterLab is not required.
 
 The ExpW evaluation manifest remains
-`/home/hung/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl`
+`/home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl`
 on the data host. The STR audit does not load it because the committed STR
 manifest already contains the image path, donor provenance, and inherited
 landmarks.

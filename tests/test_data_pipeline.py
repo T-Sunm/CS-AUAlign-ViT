@@ -1,3 +1,4 @@
+import csv
 import json
 
 import numpy as np
@@ -191,6 +192,56 @@ def test_source_interface(tmp_path):
     output, *_ = prepared_fixture(tmp_path)
     source = FaceDataset(output / "processed.jsonl", "source_train")
     assert len(source) == 1 and source[0][1] == 6
+
+
+def test_heatmap_loader_uses_conservative_spatial_validity(tmp_path):
+    from cs_aualign_vit.data.au_guidance import AU_COLUMNS, AU_IDS
+    from cs_aualign_vit.data.datasets import build_loader
+    from cs_aualign_vit.data.manifests import sha256
+
+    output, *_ = prepared_fixture(tmp_path, "expw")
+    manifest = output / "processed.jsonl"
+    sample_id = next(row["sample_id"] for row in read_jsonl(manifest) if row["split"] == "train")
+    au_cache = tmp_path / "au.csv"
+    with au_cache.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["sample_id", "status", *AU_COLUMNS])
+        writer.writeheader()
+        writer.writerow(
+            {"sample_id": sample_id, "status": "success", **dict.fromkeys(AU_COLUMNS, 2.5)}
+        )
+    spatial = tmp_path / "spatial"
+    spatial.mkdir()
+    np.save(spatial / "spatial_masks.npy", np.ones((1, 49, 12), dtype=np.float32))
+    np.save(spatial / "peaks.npy", np.ones((1, 12), dtype=np.float32))
+    (spatial / "index.csv").write_text(f"sample_id,row,status\n{sample_id},0,failed\n")
+    (spatial / "metadata.json").write_text(
+        json.dumps(
+            {
+                "au_order": list(AU_IDS),
+                "peak_threshold": 0.8,
+                "manifest_sha256s": [sha256(manifest)],
+            }
+        )
+    )
+
+    batch = next(
+        iter(
+            build_loader(
+                manifest,
+                "target_adaptation",
+                batch_size=1,
+                au_cache=au_cache,
+                spatial_cache=spatial,
+                spatial_mode="heatmap",
+            )
+        )
+    )
+    guidance = batch[2]
+    assert guidance["au_valid"].item()
+    assert guidance["landmark_valid"].item()
+    assert not guidance["heatmap_valid"].item()
+    assert not guidance["spatial_valid"].item()
+    assert not guidance["mask"].count_nonzero()
 
 
 def test_loader_keeps_global_rng_state_and_rejects_escaping_crop_path(tmp_path):

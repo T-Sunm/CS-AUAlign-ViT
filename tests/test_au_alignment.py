@@ -74,6 +74,18 @@ def test_invalid_regions_and_tiny_total_weight_do_not_count_as_evidence():
     assert torch.count_nonzero(tokens.grad) == 0
 
 
+def test_spatial_validity_excludes_rows_even_when_landmarks_are_valid():
+    tokens = torch.randn(2, 49, 3, requires_grad=True)
+    source = metadata(2)
+    target = metadata(2)
+    source["spatial_valid"] = torch.zeros(2, dtype=torch.bool)
+
+    result = compute(tokens, tokens.detach().clone(), source, target)
+
+    assert not result.valid_aus.any()
+    assert result.loss == 0
+
+
 def test_local_loss_supports_different_batch_sizes_and_is_pairing_invariant():
     source_tokens = torch.randn(2, 49, 4)
     target_tokens = torch.randn(3, 49, 4)

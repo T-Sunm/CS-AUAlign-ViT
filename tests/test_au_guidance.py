@@ -1,15 +1,21 @@
 import csv
+import json
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
 
 from cs_aualign_vit.data.au_guidance import (
     AU_COLUMNS,
+    AU_IDS,
     AUCache,
+    AUSpatialCache,
     build_au_mask,
     compute_guidance,
+    heatmaps_to_masks,
     shuffle_valid_au,
+    spatial_cache_identity,
 )
 from cs_aualign_vit.data.transforms import GuidanceTransform
 
@@ -82,3 +88,46 @@ def test_guidance_transform_flips_image_and_mask_together(monkeypatch):
 
     assert transformed[2, 0, 0] == 1 and transformed[0, 0, 1] == 1
     assert torch.equal(transformed_mask.reshape(7, 7), mask.reshape(7, 7).flip(1))
+
+
+def test_heatmap_conversion_applies_relu_pool_normalization_and_peak_gate():
+    heatmaps = torch.zeros(12, 64, 64)
+    heatmaps[0, :32] = 0.8
+    heatmaps[1] = 0.79
+    heatmaps[2] = -3
+
+    masks, peaks, valid = heatmaps_to_masks(heatmaps, peak_threshold=0.8)
+
+    assert valid and masks.shape == (49, 12)
+    assert peaks[:3].tolist() == pytest.approx([0.8, 0.79, 0.0])
+    assert masks[:, 0].max() == pytest.approx(1.0)
+    assert not torch.count_nonzero(masks[:, 1:])
+    invalid, invalid_peaks, valid = heatmaps_to_masks(
+        torch.full((12, 64, 64), float("nan"))
+    )
+    assert not valid and not torch.count_nonzero(invalid)
+    assert not torch.count_nonzero(invalid_peaks)
+
+
+def test_spatial_cache_is_strict_and_failed_rows_are_zero(tmp_path):
+    cache_dir = tmp_path / "spatial"
+    cache_dir.mkdir()
+    masks = np.ones((2, 49, 12), dtype=np.float32)
+    np.save(cache_dir / "spatial_masks.npy", masks)
+    np.save(cache_dir / "peaks.npy", np.ones((2, 12), dtype=np.float32))
+    (cache_dir / "metadata.json").write_text(
+        json.dumps({"au_order": list(AU_IDS), "peak_threshold": 0.8})
+    )
+    (cache_dir / "index.csv").write_text(
+        "sample_id,row,status\nok,0,success\nfailed,1,failed\n"
+    )
+
+    cache = AUSpatialCache(cache_dir, peak_threshold=0.8)
+
+    assert cache.get("ok")[1] and torch.equal(cache.get("ok")[0], torch.ones(49, 12))
+    assert not cache.get("failed")[1] and not torch.count_nonzero(cache.get("failed")[0])
+    with pytest.raises(KeyError, match="missing sample_id"):
+        cache.get("absent")
+    with pytest.raises(ValueError, match="peak threshold"):
+        AUSpatialCache(cache_dir, peak_threshold=0.7)
+    assert spatial_cache_identity(cache_dir) == spatial_cache_identity(cache_dir)

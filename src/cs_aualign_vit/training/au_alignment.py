@@ -21,16 +21,16 @@ class AUAlignmentResult:
     loss_components: torch.Tensor
 
 
-def _domain_statistics(tokens, intensities, masks, au_valid, landmark_valid, tau_mask, epsilon):
+def _domain_statistics(tokens, intensities, masks, au_valid, spatial_valid, tau_mask, epsilon):
     if tokens.ndim != 3 or tokens.shape[1] != 49:
         raise ValueError("Native tokens must have shape [B, 49, D]")
     batch = tokens.shape[0]
     if intensities.shape != (batch, 12) or masks.shape != (batch, 49, 12):
         raise ValueError("AU intensities and masks must have shapes [B, 12] and [B, 49, 12]")
-    if au_valid.shape != (batch,) or landmark_valid.shape != (batch,):
-        raise ValueError("AU and landmark validity must have shape [B]")
-    if au_valid.dtype != torch.bool or landmark_valid.dtype != torch.bool:
-        raise TypeError("AU and landmark validity must be boolean")
+    if au_valid.shape != (batch,) or spatial_valid.shape != (batch,):
+        raise ValueError("AU and spatial validity must have shape [B]")
+    if au_valid.dtype != torch.bool or spatial_valid.dtype != torch.bool:
+        raise TypeError("AU and spatial validity must be boolean")
 
     device = tokens.device
     values = intensities.detach().to(device=device, dtype=torch.float32)
@@ -46,7 +46,7 @@ def _domain_statistics(tokens, intensities, masks, au_valid, landmark_valid, tau
     region_features = region_features / (mask_mass[..., None] + epsilon)
     valid = (
         au_valid.to(device)[:, None]
-        & landmark_valid.to(device)[:, None]
+        & spatial_valid.to(device)[:, None]
         & (mask_mass >= tau_mask)
     )
     weights = values * valid.to(values.dtype)
@@ -81,7 +81,7 @@ def compute_au_alignment(
         source_au["au"],
         source_au["mask"],
         source_au["au_valid"],
-        source_au["landmark_valid"],
+        source_au.get("spatial_valid", source_au["landmark_valid"]),
         tau_mask,
         epsilon,
     )
@@ -90,7 +90,7 @@ def compute_au_alignment(
         target_au["au"],
         target_au["mask"],
         target_au["au_valid"],
-        target_au["landmark_valid"],
+        target_au.get("spatial_valid", target_au["landmark_valid"]),
         tau_mask,
         epsilon,
     )

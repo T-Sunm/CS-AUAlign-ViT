@@ -34,6 +34,9 @@ au_alignment:
   epsilon_weight: 1.0e-8
   r_target: 0.1
   eta: 0.0008634870173409581
+au_spatial:
+  mode: landmark
+  peak_threshold: 0.8
 preprocessing:
   image_size: 224
   mean: [0.485, 0.456, 0.406]

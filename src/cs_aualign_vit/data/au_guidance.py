@@ -1,9 +1,13 @@
 """Offline AU cache loading and landmark-guidance construction."""
 
 import csv
+import hashlib
+import json
 from pathlib import Path
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 
 AU_IDS = (1, 2, 4, 5, 6, 9, 12, 15, 17, 20, 25, 26)
 AU_COLUMNS = tuple(f"au_{au}_intensity" for au in AU_IDS)
@@ -21,6 +25,8 @@ AU_REGIONS = {
     25: "mouth",
     26: "mouth",
 }
+
+SPATIAL_FILES = ("spatial_masks.npy", "peaks.npy", "index.csv", "metadata.json")
 
 
 class AUCache:
@@ -57,6 +63,115 @@ class AUCache:
     def get(self, sample_id):
         values, valid = self._records.get(sample_id, (torch.zeros(len(AU_IDS)), False))
         return values.clone(), valid
+
+
+def heatmaps_to_masks(heatmaps, *, peak_threshold=0.8, grid=7, epsilon=1.0e-8):
+    """Convert ``[12, H, W]`` AU heatmaps to ``[grid*grid, 12]`` masks."""
+    values = torch.as_tensor(heatmaps, dtype=torch.float32)
+    if values.ndim != 3 or values.shape[0] != len(AU_IDS):
+        raise ValueError("AU heatmaps must have shape [12, H, W]")
+    if grid <= 0 or peak_threshold < 0 or epsilon <= 0:
+        raise ValueError("Invalid heatmap conversion parameters")
+    finite_channels = torch.isfinite(values).all(dim=(1, 2))
+    positive = torch.where(torch.isfinite(values), values, 0).clamp_min(0)
+    peaks = positive.amax(dim=(1, 2))
+    pooled = F.adaptive_avg_pool2d(positive[:, None], (grid, grid))[:, 0]
+    maxima = pooled.amax(dim=(1, 2))
+    keep = finite_channels & (peaks >= peak_threshold) & (maxima > epsilon)
+    normalized = pooled / (maxima[:, None, None] + epsilon)
+    normalized = torch.where(keep[:, None, None], normalized, 0)
+    masks = normalized.permute(1, 2, 0).reshape(grid * grid, len(AU_IDS))
+    return masks, peaks, bool(finite_channels.any() and torch.isfinite(masks).all())
+
+
+def spatial_cache_identity(path):
+    """Hash the four-file spatial artifact without depending on directory metadata."""
+    root = Path(path).resolve()
+    digest = hashlib.sha256()
+    for name in SPATIAL_FILES:
+        file = root / name
+        if not file.is_file():
+            raise FileNotFoundError(f"Spatial cache is missing {file}")
+        digest.update(name.encode())
+        with file.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+class AUSpatialCache:
+    """Strict sample-id view over a memory-mapped learned AU mask artifact."""
+
+    def __init__(self, path, *, manifest=None, peak_threshold=None):
+        self.path = Path(path).resolve()
+        metadata_path = self.path / "metadata.json"
+        try:
+            self.metadata = json.loads(metadata_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError) as error:
+            raise ValueError(f"Invalid spatial cache metadata: {metadata_path}") from error
+        if tuple(self.metadata.get("au_order", ())) != AU_IDS:
+            raise ValueError("Spatial cache AU order differs from the training contract")
+        if peak_threshold is not None and self.metadata.get("peak_threshold") != peak_threshold:
+            raise ValueError("Spatial cache peak threshold differs from the configuration")
+        if manifest is not None:
+            self.validate_manifest(manifest)
+        self._masks = np.load(self.path / "spatial_masks.npy", mmap_mode="r")
+        self._peaks = np.load(self.path / "peaks.npy", mmap_mode="r")
+        if self._masks.ndim != 3 or self._masks.shape[1:] != (49, len(AU_IDS)):
+            raise ValueError("Spatial masks must have shape [N, 49, 12]")
+        if self._peaks.shape != (len(self._masks), len(AU_IDS)):
+            raise ValueError("Spatial peaks must have shape [N, 12]")
+        self._records = {}
+        used_rows = set()
+        with (self.path / "index.csv").open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            if set(reader.fieldnames or ()) != {"sample_id", "row", "status"}:
+                raise ValueError("Spatial index must contain sample_id,row,status")
+            for line, record in enumerate(reader, start=2):
+                sample_id = record["sample_id"]
+                if not sample_id or sample_id in self._records:
+                    raise ValueError(f"Invalid or duplicate spatial sample_id at line {line}")
+                try:
+                    row = int(record["row"])
+                except ValueError as error:
+                    raise ValueError(f"Invalid spatial row at line {line}") from error
+                if (
+                    not 0 <= row < len(self._masks)
+                    or row in used_rows
+                    or record["status"] not in {"success", "failed"}
+                ):
+                    raise ValueError(f"Invalid spatial record at line {line}")
+                used_rows.add(row)
+                self._records[sample_id] = (row, record["status"] == "success")
+        if len(self._records) != len(self._masks):
+            raise ValueError("Spatial index and arrays have different lengths")
+
+    def get(self, sample_id):
+        record = self._records.get(sample_id)
+        if record is None:
+            raise KeyError(f"Spatial cache is missing sample_id: {sample_id}")
+        row, valid = record
+        mask = torch.from_numpy(np.array(self._masks[row], dtype=np.float32, copy=True))
+        if not valid:
+            mask.zero_()
+        if not torch.isfinite(mask).all() or (mask < 0).any() or (mask > 1).any():
+            raise ValueError(f"Invalid spatial mask for sample_id: {sample_id}")
+        return mask, valid
+
+    def validate_manifest(self, manifest):
+        identities = self.metadata.get(
+            "manifest_sha256s", [self.metadata.get("manifest_sha256")]
+        )
+        if _sha256_file(Path(manifest).resolve()) not in identities:
+            raise ValueError("Spatial cache manifest identity differs from the dataset")
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def build_au_mask(landmarks, image_size, *, grid=7):

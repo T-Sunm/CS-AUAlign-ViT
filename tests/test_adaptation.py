@@ -279,10 +279,18 @@ def test_dynamic_shuffled_builds_guidance_from_paired_metadata(tmp_path):
     )
     trainer.supervision = make_supervision(target.sample_ids)
 
-    metrics = trainer.train_step(next(iter(source_loader)), next(iter(target_loader)))
+    source_batch = next(iter(source_loader))
+    target_batch = next(iter(target_loader))
+    source_batch[2]["spatial_valid"] = torch.tensor([True, False])
+    source_batch[2]["heatmap_valid"] = torch.tensor([True, False])
+    target_batch[2]["spatial_valid"] = torch.tensor([True, True])
+    target_batch[2]["heatmap_valid"] = torch.tensor([True, True])
+    metrics = trainer.train_step(source_batch, target_batch)
 
     assert model.last_guidance.shape == (2, 49, 49)
-    assert metrics["au_nonzero_pair_ratio"] == 1
+    assert metrics["au_nonzero_pair_ratio"] == 0.5
+    assert not model.last_guidance[1].count_nonzero()
+    assert metrics["au_source_spatial_missing_ratio"] == 0.5
     assert metrics["au_shuffled_ratio"] in {0, 0.5, 1}
 
 
