@@ -30,6 +30,10 @@ def measure(logits, guidance, lam, scales, valid, strong, results):
     return logits[valid].detach().float().std().item()
 
 
+def enough_evidence(processed_batches, strong_pairs, *, min_batches, min_strong_pairs):
+    return processed_batches >= min_batches and strong_pairs >= min_strong_pairs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, default=Path("runs/adaptation/smoke-e3-b16/adaptation.pt"))
@@ -37,15 +41,33 @@ def main():
     parser.add_argument("--target-manifest", type=Path, required=True)
     parser.add_argument("--source-au-cache", type=Path, default=Path("runs/au_cache/raf_db_train.csv"))
     parser.add_argument("--target-au-cache", type=Path, default=Path("runs/au_cache/expw_train.csv"))
-    parser.add_argument("--batches", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--source-heatmap-cache", type=Path)
+    parser.add_argument("--target-heatmap-cache", type=Path)
+    parser.add_argument("--batches", type=int, default=256, help="maximum batches to scan")
+    parser.add_argument("--min-batches", type=int, default=8)
+    parser.add_argument("--min-strong-pairs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--strong-au", type=float, default=0.5)
-    parser.add_argument("--scales", type=float, nargs="+", default=[1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8])
+    parser.add_argument(
+        "--scales",
+        type=float,
+        nargs="+",
+        default=[1e6, 3e6, 1e7, 3e7, 1e8],
+    )
     args = parser.parse_args()
-    if args.batches < 1 or args.batch_size < 1 or not 0 < args.strong_au <= 1:
-        parser.error("batches and batch-size must be positive; strong-au must be in (0, 1]")
+    if (
+        args.batches < 1
+        or args.min_batches < 1
+        or args.min_batches > args.batches
+        or args.min_strong_pairs < 1
+        or args.batch_size < 1
+        or not 0 < args.strong_au <= 1
+    ):
+        parser.error("invalid scan limits, batch size, or strong-au threshold")
     if any(scale <= 0 for scale in args.scales):
         parser.error("all scales must be positive")
+    if (args.source_heatmap_cache is None) != (args.target_heatmap_cache is None):
+        parser.error("source and target heatmap caches must be provided together")
 
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = state["config"]
@@ -60,8 +82,25 @@ def main():
     if not torch.any(bcs.lambda_target_to_source.detach()) or not torch.any(bcs.lambda_source_to_target.detach()):
         raise ValueError("Both lambda vectors must have moved from zero before this pilot")
 
-    source_loader = build_loader(args.source_manifest, "source_train", batch_size=args.batch_size, seed=42, au_cache=args.source_au_cache)
-    target_loader = build_loader(args.target_manifest, "target_adaptation", batch_size=args.batch_size, seed=42, au_cache=args.target_au_cache)
+    spatial_mode = "heatmap" if args.source_heatmap_cache is not None else "landmark"
+    source_loader = build_loader(
+        args.source_manifest,
+        "source_train",
+        batch_size=args.batch_size,
+        seed=42,
+        au_cache=args.source_au_cache,
+        spatial_cache=args.source_heatmap_cache,
+        spatial_mode=spatial_mode,
+    )
+    target_loader = build_loader(
+        args.target_manifest,
+        "target_adaptation",
+        batch_size=args.batch_size,
+        seed=42,
+        au_cache=args.target_au_cache,
+        spatial_cache=args.target_heatmap_cache,
+        spatial_mode=spatial_mode,
+    )
     source_iter = iter(source_loader)
     results = {
         direction: {scale: {"change": [], "saturated": 0, "strong_rows": 0, "bias_std": []} for scale in args.scales}
@@ -69,6 +108,7 @@ def main():
     }
     logit_stds = {"t2s": [], "s2t": []}
     valid_pairs = strong_pairs = 0
+    processed_batches = 0
     amp = device.type == "cuda" and bool(config.get("amp", True))
 
     with torch.inference_mode():
@@ -85,10 +125,16 @@ def main():
             target_images = target_images[:count].to(device)
             source_au = {key: value[:count].to(device) for key, value in source_au.items()}
             target_au = {key: value[:count].to(device) for key, value in target_au.items()}
-            valid = source_au["au_valid"] & source_au["landmark_valid"] & target_au["au_valid"] & target_au["landmark_valid"]
+            valid = (
+                source_au["au_valid"]
+                & source_au["spatial_valid"]
+                & target_au["au_valid"]
+                & target_au["spatial_valid"]
+            )
             strong = valid & (source_au["au"].amax(-1) >= args.strong_au) & (target_au["au"].amax(-1) >= args.strong_au)
             valid_pairs += int(valid.sum())
             strong_pairs += int(strong.sum())
+            processed_batches += 1
             if not valid.any():
                 continue
             guidance = compute_guidance(target_au["au"], source_au["au"], target_au["mask"], source_au["mask"], valid)
@@ -105,10 +151,25 @@ def main():
                 ):
                     logits = attention_logits(block, query, key)
                     logit_stds[direction].append(measure(logits, matrix, lam, args.scales, valid, strong, results[direction]))
+            if enough_evidence(
+                processed_batches,
+                strong_pairs,
+                min_batches=args.min_batches,
+                min_strong_pairs=args.min_strong_pairs,
+            ):
+                break
 
-    if not valid_pairs or not strong_pairs:
-        raise ValueError(f"Need valid and strong AU pairs; found valid={valid_pairs}, strong={strong_pairs}. Increase --batches or lower --strong-au.")
-    print(f"checkpoint={args.checkpoint} epoch={state['completed_epoch']} valid_pairs={valid_pairs} strong_pairs={strong_pairs} amp={amp}")
+    if not valid_pairs or strong_pairs < args.min_strong_pairs:
+        raise ValueError(
+            f"Need at least {args.min_strong_pairs} strong AU pairs; scanned "
+            f"{processed_batches} batches and found valid={valid_pairs}, strong={strong_pairs}. "
+            "Increase --batches; do not lower --strong-au without defining a new protocol."
+        )
+    print(
+        f"checkpoint={args.checkpoint} epoch={state['completed_epoch']} "
+        f"batches={processed_batches} valid_pairs={valid_pairs} "
+        f"strong_pairs={strong_pairs} amp={amp}"
+    )
     print("scale      t2s_P90  s2t_P90  t2s_sat  s2t_sat  t2s_bias/logit  s2t_bias/logit  pass")
     passing = []
     for scale in args.scales:

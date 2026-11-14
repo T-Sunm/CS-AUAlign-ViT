@@ -7,7 +7,6 @@ import sys
 import time
 from pathlib import Path
 
-
 # beta = g_scale * lambda; its SGD learning rate scales with g_scale**2 * lr_lambda.
 CANDIDATES = (
     ("A", 3_000_000, 1e-6),
@@ -88,11 +87,12 @@ def eligible(row):
 
 
 def write_report(path, rows, args):
+    spatial_mode = "heatmap" if args.source_heatmap_cache else "landmark"
     lines = [
         "# AU attention training pilot matrix",
         "",
-        f"Train: RAF-DB → ExpW; seed 42; E3 config; {args.steps} steps; batch {args.batch_size}; AMP from E3 config.",
-        f"Calibration: {args.calibration_batches} fixed train batches, strong pair means max AU ≥ 0.5 in both images.",
+        f"Train: RAF-DB → ExpW; seed 42; spatial mode {spatial_mode}; {args.steps} steps; batch {args.batch_size}.",
+        f"Calibration: scan at most {args.calibration_batches} train batches; strong pair means max AU ≥ 0.5 in both images.",
         "Gate: P90 ≥ 0.01 in both directions, strong-pair saturation ≤ 5%, at least 20 strong pairs, AMP skipped steps ≤ 5%.",
         "No ExpW validation/test labels or accuracy are used for selection. Passing this pilot does not establish full-epoch stability.",
         "",
@@ -155,17 +155,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("runs/adaptation/au-attention-pilot-matrix"))
+    parser.add_argument("--config", type=Path, default=Path("configs/training/ablation/g1_heatmap.yaml"))
+    parser.add_argument("--source-heatmap-cache", type=Path)
+    parser.add_argument("--target-heatmap-cache", type=Path)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--calibration-batches", type=int, default=768)
     args = parser.parse_args()
     if min(args.steps, args.batch_size, args.calibration_batches) < 1:
         parser.error("steps, batch-size and calibration-batches must be positive")
+    if (args.source_heatmap_cache is None) != (args.target_heatmap_cache is None):
+        parser.error("source and target heatmap caches must be provided together")
     if args.output.exists():
         parser.error("output directory already exists; choose a new --output")
     args.output.mkdir(parents=True)
     report = args.output / "report.md"
-    rows = [dict(name=name, scale=scale, lr=lr, status="pending") for name, scale, lr in CANDIDATES]
+    rows = [
+        {"name": name, "scale": scale, "lr": lr, "status": "pending"}
+        for name, scale, lr in CANDIDATES
+    ]
     write_report(report, rows, args)
     scripts = Path(__file__).resolve().parent
 
@@ -175,10 +183,16 @@ def main():
         train_command = [
             sys.executable, str(scripts / "pilot_au_attention_training.py"),
             "--target-manifest", str(args.target_manifest),
+            "--config", str(args.config),
             "--output", str(args.output / name),
             "--steps", str(args.steps), "--batch-size", str(args.batch_size),
             "--g-scale", str(scale), "--lambda-learning-rate", str(lr),
         ]
+        if args.source_heatmap_cache is not None:
+            train_command += [
+                "--source-heatmap-cache", str(args.source_heatmap_cache),
+                "--target-heatmap-cache", str(args.target_heatmap_cache),
+            ]
         code, seconds = run_logged(train_command, args.output / f"{name}.train.log")
         row["train_seconds"] = seconds
         row["train"] = parse_train((args.output / f"{name}.train.log").read_text())
@@ -191,8 +205,14 @@ def main():
             "--checkpoint", str(args.output / name / "adaptation.pt"),
             "--target-manifest", str(args.target_manifest),
             "--batches", str(args.calibration_batches),
+            "--min-strong-pairs", str(MIN_STRONG_PAIRS),
             "--scales", str(scale),
         ]
+        if args.source_heatmap_cache is not None:
+            calibration_command += [
+                "--source-heatmap-cache", str(args.source_heatmap_cache),
+                "--target-heatmap-cache", str(args.target_heatmap_cache),
+            ]
         code, seconds = run_logged(calibration_command, args.output / f"{name}.calibration.log")
         row["calibration_seconds"] = seconds
         row["calibration"] = parse_calibration(

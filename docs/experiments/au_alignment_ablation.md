@@ -10,6 +10,7 @@ E1, E2, E3 và E4. E5 chưa có checkpoint hoàn chỉnh nên chưa được đ�
 | E1 — AU attention | Dynamic | Off | 64.35% | +0.68 điểm % | 42.77% | 43.67% | 62.43% |
 | E2 — AU alignment | Off | On | **65.86%** | **+2.20 điểm %** | 44.58% | **44.25%** | 64.21% |
 | E3 — Both | Dynamic | On | 65.65% | +1.98 điểm % | 44.01% | 43.83% | 63.80% |
+| E3-no-STR — Both, không STR | Dynamic | On | 65.78% | +2.11 điểm % | 44.12% | 43.39% | 63.81% |
 | E4 — Alignment shuffled | Off | Shuffled | 65.64% | +1.97 điểm % | **44.82%** | 44.07% | **64.50%** |
 | E5 — Attention shuffled | Dynamic shuffled | Off | — | — | — | — | — |
 
@@ -26,6 +27,13 @@ accuracy (`44.82%`) và weighted F1 (`64.50%`) cao nhất. Tuy nhiên, E1 và E2
 chạy batch size 45 trong khi E3 và E4 chạy batch size 64. Vì vậy, chênh lệch
 giữa các run này không chỉ phản ánh duy nhất AU attention/alignment và cần được
 ghi nhận như một protocol confound.
+
+E3-no-STR chọn best checkpoint tại epoch 34 và đạt `65.78%` accuracy, cao hơn
+E3 `0.12` điểm phần trăm. Balanced accuracy và weighted F1 gần như không đổi,
+còn macro F1 giảm `0.44` điểm phần trăm. Best checkpoint của E3 nằm ở epoch 21,
+trước STR đầu tiên tại epoch 25, nên so sánh này cho thấy model selection không
+thu được lợi ích rõ ràng từ phần training sau STR; nó không phải phép so sánh
+hai checkpoint cùng epoch chỉ khác việc có hay không có ảnh STR.
 
 ## Thời điểm STR ảnh hưởng đến checkpoint
 

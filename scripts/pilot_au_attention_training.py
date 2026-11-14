@@ -6,9 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import train_adaptation
 import yaml
 
-import train_adaptation
 from cs_aualign_vit.data.au_guidance import compute_guidance
 from cs_aualign_vit.training.adaptation import AdaptationTrainer
 
@@ -21,8 +21,8 @@ def post_update_metrics(trainer, source_batch, target_batch):
     source_images, _, source_au = source_batch
     target_images, _, target_au = target_batch
     valid = (
-        source_au["au_valid"] & source_au["landmark_valid"]
-        & target_au["au_valid"] & target_au["landmark_valid"]
+        source_au["au_valid"] & source_au["spatial_valid"]
+        & target_au["au_valid"] & target_au["spatial_valid"]
     )
     guidance = compute_guidance(
         target_au["au"], source_au["au"],
@@ -55,6 +55,16 @@ def main():
     parser.add_argument("--source-checkpoint", type=Path, default=Path("runs/source-pretraining-val/best.pt"))
     parser.add_argument("--source-au-cache", type=Path, default=Path("runs/au_cache/raf_db_train.csv"))
     parser.add_argument("--target-au-cache", type=Path, default=Path("runs/au_cache/expw_train.csv"))
+    parser.add_argument("--source-heatmap-cache", type=Path)
+    parser.add_argument("--target-heatmap-cache", type=Path)
+    parser.add_argument(
+        "--heatmap-python", type=Path, default=Path("tools/au_heatmap/.venv/bin/python")
+    )
+    parser.add_argument(
+        "--heatmap-checkpoint",
+        type=Path,
+        default=Path("tools/au_heatmap/checkpoints/disfa_adaptation_f0.pth"),
+    )
     parser.add_argument("--config", type=Path, default=Path("configs/training/ablation/e3_both.yaml"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=10)
@@ -68,6 +78,8 @@ def main():
         parser.error("g-scale and lambda-learning-rate must be finite positive numbers")
     if args.output.exists():
         parser.error("output directory already exists; choose a new pilot directory")
+    if (args.source_heatmap_cache is None) != (args.target_heatmap_cache is None):
+        parser.error("source and target heatmap caches must be provided together")
 
     config = yaml.safe_load(args.config.read_text())
     config["training"].update(max_epochs=1, batch_size=args.batch_size, str_epochs=[])
@@ -75,6 +87,10 @@ def main():
         mode="dynamic", g_scale=args.g_scale,
         lambda_learning_rate=args.lambda_learning_rate,
     )
+    config["au_spatial"] = {
+        "mode": "heatmap" if args.source_heatmap_cache is not None else "landmark",
+        "peak_threshold": 0.8,
+    }
     train_adaptation.validate_config(config)
     run_args = SimpleNamespace(
         source_manifest=args.source_manifest,
@@ -83,6 +99,10 @@ def main():
         source_au_cache=args.source_au_cache,
         target_au_cache=args.target_au_cache,
         au_python=Path(".venv-au/bin/python"),
+        source_heatmap_cache=args.source_heatmap_cache,
+        target_heatmap_cache=args.target_heatmap_cache,
+        heatmap_python=args.heatmap_python,
+        heatmap_checkpoint=args.heatmap_checkpoint,
         config=SimpleNamespace(read_text=lambda: yaml.safe_dump(config)),
         output=args.output,
         resume=None,

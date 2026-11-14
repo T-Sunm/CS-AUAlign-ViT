@@ -36,10 +36,15 @@ def parse_args():
     parser.add_argument("--split", choices=("train", "validation", "test"), default="train")
     parser.add_argument("--peak-threshold", type=float, default=0.8)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--checkpoint-every", type=int, default=5000)
     return parser.parse_args()
 
 
 def load_existing(output):
+    backup = output.with_name(output.name + ".previous")
+    if not output.exists() and backup.exists():
+        os.replace(backup, output)
     if not output.exists():
         return [], np.empty((0, 49, 12), np.float32), np.empty((0, 12), np.float32), {}
     with (output / "index.csv").open(newline="") as stream:
@@ -80,8 +85,10 @@ def publish(output, records, masks, peaks, metadata):
 
 
 def run(args):
-    if args.peak_threshold < 0:
-        raise ValueError("peak threshold must be non-negative")
+    batch_size = getattr(args, "batch_size", 16)
+    checkpoint_every = getattr(args, "checkpoint_every", 5000)
+    if args.peak_threshold < 0 or batch_size < 1 or checkpoint_every < 1:
+        raise ValueError("threshold must be non-negative; batch sizes must be positive")
     manifest = args.manifest.resolve()
     checkpoint = args.checkpoint.resolve()
     output = args.output.resolve()
@@ -89,9 +96,10 @@ def run(args):
     sys.path.insert(0, str(tool))
     from au_heatmap import AUHeatmapDetector
 
-    records, masks, peaks, old_metadata = load_existing(output)
+    records, old_masks, old_peaks, old_metadata = load_existing(output)
+    checkpoint_sha256 = sha256(checkpoint)
     if old_metadata:
-        if old_metadata.get("checkpoint_sha256") != sha256(checkpoint):
+        if old_metadata.get("checkpoint_sha256") != checkpoint_sha256:
             raise ValueError("Existing heatmap cache uses a different checkpoint")
         if old_metadata.get("peak_threshold") != args.peak_threshold:
             raise ValueError("Existing heatmap cache uses a different peak threshold")
@@ -104,63 +112,96 @@ def run(args):
         for row in validate_rows(read_jsonl(manifest))
         if row["usable"] and row["split"] == args.split
     ]
-    for row in rows:
-        sample_id = row["sample_id"]
-        position = positions.get(sample_id)
-        if position is not None and records[position]["status"] == "success":
-            continue
-        mask = np.zeros((49, 12), dtype=np.float32)
-        peak = np.zeros(12, dtype=np.float32)
-        status = "failed"
-        try:
-            image_path = (manifest.parent / row["processed_path"]).resolve()
-            with Image.open(image_path) as image:
-                rgb = np.asarray(image.convert("RGB"))
-            heatmaps, _ = detector([rgb])
-            converted, raw_peaks, valid = heatmaps_to_masks(
-                heatmaps[0], peak_threshold=args.peak_threshold
-            )
-            if valid:
-                mask = converted.numpy()
-                peak = raw_peaks.numpy()
-                status = "success"
-        except (OSError, RuntimeError, ValueError):
-            pass
-        if position is None:
-            position = len(records)
-            positions[sample_id] = position
-            records.append({"sample_id": sample_id, "row": str(position), "status": status})
-            masks = np.concatenate((masks, mask[None]), axis=0)
-            peaks = np.concatenate((peaks, peak[None]), axis=0)
-        else:
-            records[position]["status"] = status
-            masks[position] = mask
-            peaks[position] = peak
-
     manifest_ids = set(old_metadata.get("manifest_sha256s", ()))
     if old_metadata.get("manifest_sha256"):
         manifest_ids.add(old_metadata["manifest_sha256"])
     manifest_ids.add(sha256(manifest))
-    metadata = {
-        "au_order": list(AU_IDS),
-        "checkpoint_path": str(checkpoint),
-        "checkpoint_sha256": sha256(checkpoint),
-        "manifest_sha256s": sorted(manifest_ids),
-        "manifest_path": str(manifest),
-        "split": args.split,
-        "peak_threshold": args.peak_threshold,
-        "resize": {"size": [256, 256], "interpolation": "bilinear"},
-        "input_normalization": "per-image min-max [0,1]",
-        "pooling": "adaptive-average 7x7",
-        "mask_normalization": "per-channel max",
-        "epsilon": 1.0e-8,
-        "dtype": "float32",
-        "shape": list(masks.shape),
-        "record_count": len(records),
-        "success_count": sum(record["status"] == "success" for record in records),
-        "failure_count": sum(record["status"] == "failed" for record in records),
-    }
-    publish(output, records, masks, peaks, metadata)
+    work = [
+        row
+        for row in rows
+        if row["sample_id"] not in positions
+        or records[positions[row["sample_id"]]]["status"] == "failed"
+    ]
+    capacity = len(records) + sum(row["sample_id"] not in positions for row in work)
+    masks = np.zeros((capacity, 49, 12), dtype=np.float32)
+    peaks = np.zeros((capacity, 12), dtype=np.float32)
+    masks[: len(old_masks)] = old_masks
+    peaks[: len(old_peaks)] = old_peaks
+
+    def metadata():
+        return {
+            "au_order": list(AU_IDS),
+            "checkpoint_path": str(checkpoint),
+            "checkpoint_sha256": checkpoint_sha256,
+            "manifest_sha256s": sorted(manifest_ids),
+            "manifest_path": str(manifest),
+            "split": args.split,
+            "peak_threshold": args.peak_threshold,
+            "resize": {"size": [256, 256], "interpolation": "bilinear"},
+            "input_normalization": "per-image min-max [0,1]",
+            "pooling": "adaptive-average 7x7",
+            "mask_normalization": "per-channel max",
+            "epsilon": 1.0e-8,
+            "dtype": "float32",
+            "shape": [len(records), 49, 12],
+            "record_count": len(records),
+            "success_count": sum(record["status"] == "success" for record in records),
+            "failure_count": sum(record["status"] == "failed" for record in records),
+            "batch_size": batch_size,
+        }
+
+    processed = 0
+    next_checkpoint = checkpoint_every
+    for start in range(0, len(work), batch_size):
+        batch = work[start : start + batch_size]
+        images = []
+        loadable = []
+        results = {}
+        for row in batch:
+            try:
+                image_path = (manifest.parent / row["processed_path"]).resolve()
+                with Image.open(image_path) as image:
+                    images.append(np.array(image.convert("RGB"), copy=True))
+                loadable.append(row)
+            except (OSError, ValueError):
+                results[row["sample_id"]] = None
+        if images:
+            heatmaps, _ = detector(images)
+            if len(heatmaps) != len(loadable):
+                raise RuntimeError("Heatmap model returned the wrong batch size")
+            for row, heatmap in zip(loadable, heatmaps, strict=True):
+                converted, raw_peaks, valid = heatmaps_to_masks(
+                    heatmap, peak_threshold=args.peak_threshold
+                )
+                results[row["sample_id"]] = (
+                    converted.numpy(),
+                    raw_peaks.numpy(),
+                ) if valid else None
+        for row in batch:
+            sample_id = row["sample_id"]
+            position = positions.get(sample_id)
+            if position is None:
+                position = len(records)
+                positions[sample_id] = position
+                records.append({"sample_id": sample_id, "row": str(position), "status": "failed"})
+            result = results[sample_id]
+            records[position]["status"] = "success" if result is not None else "failed"
+            masks[position].fill(0)
+            peaks[position].fill(0)
+            if result is not None:
+                masks[position], peaks[position] = result
+        processed += len(batch)
+        if processed >= next_checkpoint:
+            publish(output, records, masks[: len(records)], peaks[: len(records)], metadata())
+            print(f"checkpointed {processed}/{len(work)} pending records", flush=True)
+            next_checkpoint += checkpoint_every
+
+    publish(output, records, masks[: len(records)], peaks[: len(records)], metadata())
+    print(
+        f"complete records={len(records)} success={metadata()['success_count']} "
+        f"failed={metadata()['failure_count']} output={output}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

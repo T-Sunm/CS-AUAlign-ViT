@@ -37,7 +37,7 @@ khóa từ pilot Task 7. E1, E3 và E5 dùng cùng hai giá trị này. AU align
 dùng `tau_mask=1.0`, `n_eff_min=8`, `eta=0.0008634870173409581` và 12 giá trị
 `q_c` trong
 [`adaptation.yaml`](../../configs/training/adaptation.yaml). Cơ sở calibration
-nằm trong [`au_alignment_calibration.md`](../../reports/au_alignment_calibration.md).
+nằm trong [`au_alignment_calibration.md`](../experiments/au_alignment_calibration.md).
 Không calibration lại các giá trị này giữa các experiment. AU attention pilot
 không dùng ExpW validation hoặc test accuracy; kết quả được lưu tại
 [`au-attention-pilot-matrix/report.md`](../../runs/adaptation/au-attention-pilot-matrix/report.md).

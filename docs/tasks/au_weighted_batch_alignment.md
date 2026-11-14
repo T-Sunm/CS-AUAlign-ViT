@@ -267,7 +267,7 @@ tương đương POST gốc.
 
 Calibration nằm trong `notebooks/au_alignment_calibration.ipynb`. Notebook
 ghi lựa chọn cuối cùng và số liệu hỗ trợ vào
-`reports/au_alignment_calibration.md`; các giá trị đã chọn được chép vào
+`docs/experiments/au_alignment_calibration.md`; các giá trị đã chọn được chép vào
 adaptation config trước smoke train.
 
 Mỗi epoch log `loss_local`, `eta*loss_local`, số AU hợp lệ, tỷ lệ batch có
@@ -329,7 +329,7 @@ Task hoàn thành khi:
    baseline equivalence theo cùng AU attention mode và checkpoint/resume.
 5. Smoke train chạy được với alignment bật; tỷ lệ batch có local loss và
    các chỉ số `N_eff` được báo cáo.
-6. Adaptation config và `reports/au_alignment_calibration.md` chứa các giá trị
+6. Adaptation config và `docs/experiments/au_alignment_calibration.md` chứa các giá trị
    cuối cùng. Task không yêu cầu full adaptation training.
 
 Full experiments thuộc Task 8.2. Vòng đầu so sánh bốn cấu hình: attention và

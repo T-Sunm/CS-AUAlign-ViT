@@ -3,6 +3,70 @@
 The standalone 12-AU heatmap extractor is documented in
 [`tools/au_heatmap/README.md`](tools/au_heatmap/README.md).
 
+Build and audit the learned spatial caches for Task 9.2 before starting G1:
+
+```bash
+tools/au_heatmap/.venv/bin/python scripts/extract_au_heatmap_cache.py \
+  --manifest data/processed/raf-v5-deduplicated/processed.jsonl \
+  --output runs/au_heatmap_cache/raf_db_train \
+  --checkpoint tools/au_heatmap/checkpoints/disfa_adaptation_f0.pth \
+  --device cuda:0 --batch-size 16
+
+tools/au_heatmap/.venv/bin/python scripts/extract_au_heatmap_cache.py \
+  --manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --output runs/au_heatmap_cache/expw_train \
+  --checkpoint tools/au_heatmap/checkpoints/disfa_adaptation_f0.pth \
+  --device cuda:0 --batch-size 16
+
+uv run --active python scripts/audit_au_heatmap_cache.py \
+  --source-manifest data/processed/raf-v5-deduplicated/processed.jsonl \
+  --source-au-cache runs/au_cache/raf_db_train.csv \
+  --source-heatmap-cache runs/au_heatmap_cache/raf_db_train \
+  --target-manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --target-au-cache runs/au_cache/expw_train.csv \
+  --target-heatmap-cache runs/au_heatmap_cache/expw_train \
+  --output runs/au_heatmap_cache/audit.json
+```
+
+The extractor checkpoints atomically every 5,000 pending records. Re-running
+the same command skips successful rows and retries failed rows.
+
+After both caches pass the audit, run the short G1 training pilot and attention
+gate before the full experiment:
+
+```bash
+uv run --active python scripts/pilot_au_attention_training.py \
+  --target-manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --source-heatmap-cache runs/au_heatmap_cache/raf_db_train \
+  --target-heatmap-cache runs/au_heatmap_cache/expw_train \
+  --config configs/training/ablation/g1_heatmap.yaml \
+  --output runs/adaptation/g1-heatmap-pilot \
+  --steps 3 --batch-size 16 \
+  --g-scale 3000000 --lambda-learning-rate 0.000001
+
+uv run --active python scripts/calibrate_au_attention.py \
+  --checkpoint runs/adaptation/g1-heatmap-pilot/adaptation.pt \
+  --target-manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --source-heatmap-cache runs/au_heatmap_cache/raf_db_train \
+  --target-heatmap-cache runs/au_heatmap_cache/expw_train \
+  --scales 3000000
+```
+
+Only after the gate passes, start the full G1 run:
+
+```bash
+uv run --active python scripts/train_adaptation.py \
+  --source-manifest data/processed/raf-v5-deduplicated/processed.jsonl \
+  --target-manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --source-checkpoint runs/source-pretraining-val/best.pt \
+  --source-au-cache runs/au_cache/raf_db_train.csv \
+  --target-au-cache runs/au_cache/expw_train.csv \
+  --source-heatmap-cache runs/au_heatmap_cache/raf_db_train \
+  --target-heatmap-cache runs/au_heatmap_cache/expw_train \
+  --config configs/training/ablation/g1_heatmap.yaml \
+  --output runs/adaptation/g1-heatmap-100epochs-seed42
+```
+
 Research implementation progressing from POST–Swin to POST-style ViT and
 AU-guided cross-domain adaptation. Source pretraining fine-tunes ImageNet
 Swin-Tiny on RAF-DB while learning a seven-class prototype bank.
