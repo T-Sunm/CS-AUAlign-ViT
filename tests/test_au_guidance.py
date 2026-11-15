@@ -109,6 +109,18 @@ def test_heatmap_conversion_applies_relu_pool_normalization_and_peak_gate():
     assert not torch.count_nonzero(invalid_peaks)
 
 
+def test_heatmap_without_peak_gate_keeps_weak_signal_but_rejects_empty_or_nonfinite():
+    heatmaps = torch.zeros(12, 64, 64)
+    heatmaps[0, :32] = 0.4
+    heatmaps[1] = -1
+    heatmaps[2] = float("nan")
+    masks, peaks, valid = heatmaps_to_masks(heatmaps, peak_threshold=0.0)
+    assert valid
+    assert peaks[0] == pytest.approx(0.4)
+    assert masks[:, 0].max() == pytest.approx(1.0)
+    assert not torch.count_nonzero(masks[:, 1:3])
+
+
 def test_spatial_cache_is_strict_and_failed_rows_are_zero(tmp_path):
     cache_dir = tmp_path / "spatial"
     cache_dir.mkdir()

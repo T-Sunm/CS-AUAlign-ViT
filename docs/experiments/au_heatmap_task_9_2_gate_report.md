@@ -49,3 +49,9 @@ E3's resolved config matches G0's training horizon (100), batch size (64), seed 
 | 8. ExpW comparison and limitations | E3 metrics above | State explicitly that G1 test metrics and a performance comparison are unavailable. Retain one-seed and DISFA domain-shift limitations. |
 
 This inventory is based on existing files and logs. It does not claim that the test suite ran or that all acceptance criteria passed. No further parameter search or full training is authorized by this gate decision.
+
+## Exploratory full-run result and next ablation
+
+The separate G1 exploratory run completed 100 epochs. Its best checkpoint was selected at epoch 2 by ExpW validation and [evaluated once on ExpW test](../../runs/adaptation/g1-heatmap-100epochs-exploratory-seed42/expw_test.json): 8,062 samples, accuracy 64.17%, balanced accuracy 44.61%, macro F1 42.92%, weighted F1 63.11%. The existing E3 test result above is respectively 65.65%, 44.01%, 43.83% and 63.80%. The G1 test confusion matrix shows zero correct predictions for class 2. This is a descriptive comparison of the recorded runs; the G1 attention gate had failed before full training.
+
+The next ablation is `g1_heatmap_no_peak_gate.yaml`. It sets the existing conversion parameter `peak_threshold` to 0 while retaining per-channel max normalization, the same LibreFace intensities and the other training settings. Heatmaps with no positive pooled signal or nonfinite values still yield zero masks. This variant requires fresh offline caches and a new run identity. Its design is motivated by the high rate of zero mask channels and the reduction from about 11.11 valid alignment AUs per batch in E3 to 4.66 at exploratory G1 epoch 2. Those observations motivate the test; they do not establish that the peak gate caused the performance gap. Because the ExpW test result above has already been viewed, evaluate the ablation using train diagnostics and ExpW validation before any further test-set use.
