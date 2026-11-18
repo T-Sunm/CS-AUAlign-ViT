@@ -64,6 +64,7 @@ def validate_config(config):
         },
     )
     config.setdefault("au_spatial", {"mode": "landmark", "peak_threshold": 0.8})
+    config.setdefault("source_sampling", {"mode": "random", "replacement": True})
     sections = (
         "training",
         "loss",
@@ -73,6 +74,7 @@ def validate_config(config):
         "au_guidance",
         "au_alignment",
         "au_spatial",
+        "source_sampling",
     )
     if any(not isinstance(config.get(section), dict) for section in sections):
         raise ValueError("Incomplete adaptation configuration")
@@ -108,6 +110,7 @@ def validate_config(config):
             "eta",
         },
         "au_spatial": {"mode", "peak_threshold"},
+        "source_sampling": {"mode", "replacement"},
     }
     if any(required[name] - config[name].keys() for name in required):
         raise ValueError("Incomplete adaptation configuration")
@@ -116,6 +119,11 @@ def validate_config(config):
         raise ValueError("batch_size must be positive and num_workers non-negative")
     if type(training["amp"]) is not bool:
         raise ValueError("training.amp must be true or false")
+    source_sampling = config["source_sampling"]
+    if source_sampling["mode"] not in {"random", "sqrt_balanced"}:
+        raise ValueError("source_sampling.mode must be random or sqrt_balanced")
+    if type(source_sampling["replacement"]) is not bool:
+        raise ValueError("source_sampling.replacement must be true or false")
     guidance = config["au_guidance"]
     if guidance["mode"] not in {"off", "dynamic", "dynamic_shuffled"}:
         raise ValueError("Invalid au_guidance.mode")
@@ -177,7 +185,8 @@ def prepare_run_files(output, config, source_au_cache=None, *, resume=False):
     """Persist resolved config and isolate the mutable source AU cache."""
     resolved_config = output / "resolved_config.yaml"
     if resolved_config.exists():
-        if yaml.safe_load(resolved_config.read_text()) != config:
+        saved_config = validate_config(yaml.safe_load(resolved_config.read_text()))
+        if saved_config != config:
             raise ValueError("Resolved adaptation configuration differs from the current run")
     else:
         resolved_config.write_text(yaml.safe_dump(config, sort_keys=False))
@@ -230,6 +239,7 @@ def run(args):
     guidance = config["au_guidance"]
     alignment = config["au_alignment"]
     spatial = config["au_spatial"]
+    source_sampling = config["source_sampling"]
     guidance_enabled = guidance["mode"] != "off"
     au_enabled = guidance_enabled or alignment["enabled"]
     original_source_au_cache = getattr(args, "source_au_cache", None)
@@ -288,6 +298,8 @@ def run(args):
         spatial_cache=source_spatial_cache if heatmap_enabled else None,
         spatial_mode=spatial["mode"],
         peak_threshold=spatial["peak_threshold"],
+        sampling_mode=source_sampling["mode"],
+        sampling_replacement=source_sampling["replacement"],
         **loader_options,
     )
     target_loader = build_loader(
@@ -372,6 +384,8 @@ def run(args):
         au_alignment_eta=alignment["eta"],
         au_spatial_mode=spatial["mode"],
         au_spatial_peak_threshold=spatial["peak_threshold"],
+        source_sampling_mode=source_sampling["mode"],
+        source_sampling_replacement=source_sampling["replacement"],
         **config["loss"],
     )
     resampler = SelfTrainingResampler(
@@ -392,6 +406,8 @@ def run(args):
         heatmap_python=heatmap_python if heatmap_enabled else None,
         heatmap_checkpoint=heatmap_checkpoint if heatmap_enabled else None,
         peak_threshold=spatial["peak_threshold"],
+        source_sampling_mode=source_sampling["mode"],
+        source_sampling_replacement=source_sampling["replacement"],
     )
     trainer = AdaptationTrainer(
         model=model,

@@ -53,6 +53,8 @@ class SelfTrainingResampler:
         heatmap_python=None,
         heatmap_checkpoint=None,
         peak_threshold=0.8,
+        source_sampling_mode="random",
+        source_sampling_replacement=True,
     ):
         dataset = target_feature_loader.dataset
         if not isinstance(dataset, FaceDataset) or dataset.role != "target_features":
@@ -73,6 +75,8 @@ class SelfTrainingResampler:
         self.num_workers = num_workers
         self.num_classes = num_classes
         self.confidence_threshold = confidence_threshold
+        self.source_sampling_mode = source_sampling_mode
+        self.source_sampling_replacement = source_sampling_replacement
         self.au_cache = Path(au_cache).resolve() if au_cache is not None else None
         self.au_python = Path(au_python).absolute() if au_python is not None else None
         if (self.au_cache is None) != (self.au_python is None):
@@ -382,4 +386,6 @@ class SelfTrainingResampler:
             spatial_cache=self.spatial_cache,
             spatial_mode=self.spatial_mode,
             peak_threshold=self.peak_threshold,
+            sampling_mode=self.source_sampling_mode,
+            sampling_replacement=self.source_sampling_replacement,
         )

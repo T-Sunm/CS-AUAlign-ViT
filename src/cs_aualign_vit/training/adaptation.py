@@ -53,6 +53,8 @@ class AdaptationConfig:
     au_alignment_eta: float | None = None
     au_spatial_mode: str = "landmark"
     au_spatial_peak_threshold: float = 0.8
+    source_sampling_mode: str = "random"
+    source_sampling_replacement: bool = True
 
     def __post_init__(self):
         if self.max_epochs < 1 or self.kmeans_interval < 1 or self.num_classes < 1:
@@ -73,6 +75,10 @@ class AdaptationConfig:
             raise ValueError("au_spatial_mode must be landmark or heatmap")
         if self.au_spatial_peak_threshold < 0:
             raise ValueError("au_spatial_peak_threshold must be non-negative")
+        if self.source_sampling_mode not in {"random", "sqrt_balanced"}:
+            raise ValueError("source_sampling_mode must be random or sqrt_balanced")
+        if type(self.source_sampling_replacement) is not bool:
+            raise ValueError("source_sampling_replacement must be boolean")
         if self.au_alignment_epsilon <= 0 or self.au_alignment_epsilon_weight < 0:
             raise ValueError("AU alignment epsilons are invalid")
         if self.au_alignment_r_target <= 0:
@@ -230,11 +236,11 @@ class AdaptationTrainer:
             raise RuntimeError("Target supervision must be refreshed before training")
         needs_au = self.config.au_mode != "off" or self.config.au_alignment_enabled
         if not needs_au:
-            source_images, source_labels = source_batch
+            source_images, source_labels = source_batch[:2]
             target_images, sample_ids = target_batch
             source_au = target_au = None
         else:
-            source_images, source_labels, source_au = source_batch
+            source_images, source_labels, source_au = source_batch[:3]
             target_images, sample_ids, target_au = target_batch
         if needs_au:
             source_spatial_valid = source_au.get(
@@ -442,12 +448,31 @@ class AdaptationTrainer:
         source_iterator = iter(self.source_loader)
         totals = {}
         steps = 0
+        dataset_class_counts = [0] * self.config.num_classes
+        source_datasets = getattr(
+            self.source_loader.dataset, "datasets", [self.source_loader.dataset]
+        )
+        for dataset in source_datasets:
+            if not hasattr(dataset, "samples"):
+                continue
+            for sample in dataset.samples:
+                dataset_class_counts[sample["label"]] += 1
+        sampled_class_counts = [0] * self.config.num_classes
+        unique_samples = [set() for _ in range(self.config.num_classes)]
         for target_batch in self.target_loader:
             try:
                 source_batch = next(source_iterator)
             except StopIteration:
                 source_iterator = iter(self.source_loader)
                 source_batch = next(source_iterator)
+            source_labels = source_batch[1].tolist()
+            needs_au = self.config.au_mode != "off" or self.config.au_alignment_enabled
+            expected_size = 4 if needs_au else 3
+            source_ids = source_batch[-1] if len(source_batch) == expected_size else None
+            for index, label in enumerate(source_labels):
+                sampled_class_counts[label] += 1
+                if source_ids is not None:
+                    unique_samples[label].add(source_ids[index])
             metrics = self.train_step(source_batch, target_batch)
             for name, value in metrics.items():
                 totals[name] = totals.get(name, 0.0) + value
@@ -464,6 +489,20 @@ class AdaptationTrainer:
         if progress:
             sys.stdout.write("\n")
         result = {name: value / steps for name, value in totals.items()} | {"steps": steps}
+        result.update(
+            source_dataset_class_counts=dataset_class_counts,
+            source_sampled_class_counts=sampled_class_counts,
+            source_unique_samples_per_class=[len(samples) for samples in unique_samples],
+            trusted_pseudo_label_counts=[
+                int(
+                    (
+                        self.supervision.trusted_mask
+                        & self.supervision.pseudo_labels.eq(index)
+                    ).sum()
+                )
+                for index in range(self.config.num_classes)
+            ],
+        )
         component_names = [f"au_alignment_loss_component_{index}" for index in range(12)]
         if any(name in totals for name in component_names):
             component_total = sum(totals.get(name, 0.0) for name in component_names)
@@ -677,6 +716,8 @@ class AdaptationTrainer:
         saved_config.setdefault("au_alignment_eta", None)
         saved_config.setdefault("au_spatial_mode", "landmark")
         saved_config.setdefault("au_spatial_peak_threshold", 0.8)
+        saved_config.setdefault("source_sampling_mode", "random")
+        saved_config.setdefault("source_sampling_replacement", True)
         if saved_config != asdict(self.config):
             raise ValueError("Saved adaptation configuration differs from the current run")
         expected_au_identity = (

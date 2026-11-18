@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from PIL import Image
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, WeightedRandomSampler
 
 from .au_guidance import AUCache, AUSpatialCache, build_au_mask
 from .manifests import read_jsonl, validate_rows
@@ -20,6 +20,7 @@ class FaceDataset(Dataset):
         au_cache=None,
         spatial_cache=None,
         spatial_mode="landmark",
+        include_sample_id=False,
     ):
         allowed = {"source_train", "target_adaptation", "target_features", "evaluation"}
         if role not in allowed:
@@ -55,6 +56,7 @@ class FaceDataset(Dataset):
         if spatial_cache is not None:
             spatial_cache.validate_manifest(manifest)
         self.transform = transform or build_transform(role in {"source_train", "target_adaptation"})
+        self.include_sample_id = include_sample_id
         self.samples = []
         for row in rows:
             if row["split"] != split or not row["usable"]:
@@ -109,7 +111,8 @@ class FaceDataset(Dataset):
             if self.role in {"target_adaptation", "target_features"}
             else record["label"]
         )
-        return (tensor, identity) if guidance is None else (tensor, identity, guidance)
+        result = (tensor, identity) if guidance is None else (tensor, identity, guidance)
+        return (*result, record["sample_id"]) if self.include_sample_id else result
 
     def metadata(self, sample_id):
         """STR accesses stored coordinates; adaptation metadata contains no labels."""
@@ -200,8 +203,10 @@ def build_source_loader(
     spatial_cache=None,
     spatial_mode="landmark",
     peak_threshold=0.8,
+    sampling_mode="random",
+    sampling_replacement=True,
 ):
-    """Shuffled source loader over the original manifest plus any non-empty STR manifests.
+    """Source loader over the original manifest plus any non-empty STR manifests.
 
     The first manifest is mandatory; later ones (STR rounds) are skipped when absent or empty.
     """
@@ -209,6 +214,10 @@ def build_source_loader(
 
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if sampling_mode not in {"random", "sqrt_balanced"}:
+        raise ValueError("sampling_mode must be random or sqrt_balanced")
+    if type(sampling_replacement) is not bool:
+        raise ValueError("sampling_replacement must be boolean")
     manifests = [Path(m) for m in manifests]
     if not manifests:
         raise ValueError("At least the original source manifest is required")
@@ -237,6 +246,7 @@ def build_source_loader(
             au_cache=cache,
             spatial_cache=spatial,
             spatial_mode=spatial_mode,
+            include_sample_id=sampling_mode == "sqrt_balanced",
         )
     ]
     for extra in manifests[1:]:
@@ -249,14 +259,31 @@ def build_source_loader(
                     au_cache=cache,
                     spatial_cache=spatial,
                     spatial_mode=spatial_mode,
+                    include_sample_id=sampling_mode == "sqrt_balanced",
                 )
             )
+    dataset = ConcatDataset(datasets)
+    generator = torch.Generator().manual_seed(seed)
+    sampler = None
+    if sampling_mode == "sqrt_balanced":
+        labels = torch.tensor(
+            [sample["label"] for child in datasets for sample in child.samples],
+            dtype=torch.long,
+        )
+        class_counts = torch.bincount(labels)
+        sampler = WeightedRandomSampler(
+            weights=class_counts[labels].float().rsqrt(),
+            num_samples=len(dataset),
+            replacement=sampling_replacement,
+            generator=generator,
+        )
     return DataLoader(
-        ConcatDataset(datasets),
+        dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=num_workers,
-        generator=torch.Generator().manual_seed(seed),
+        generator=generator,
         worker_init_fn=_seed_worker,
         drop_last=drop_last,
     )

@@ -20,6 +20,9 @@ adversarial:
   lambda_grl: 1.0
 str:
   confidence_threshold: 0.95
+source_sampling:
+  mode: random
+  replacement: true
 au_guidance:
   mode: "off"
   g_scale: 1.0
