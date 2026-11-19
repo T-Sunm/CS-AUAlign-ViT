@@ -10,6 +10,7 @@ from .target_supervision import (
     refresh_target_supervision,
     target_supervision_diagnostics,
 )
+from .ustst import USTSTConfig, USTSTTrainer
 
 __all__ = [
     "AUAlignmentResult",
@@ -17,12 +18,14 @@ __all__ = [
     "AdaptationTrainer",
     "PrototypeLosses",
     "TargetSupervision",
+    "USTSTConfig",
+    "USTSTTrainer",
     "compute_au_alignment",
     "compute_prototype_losses",
     "evaluate",
     "evaluate_target",
-    "metrics_from_confusion",
     "load_checkpoint",
+    "metrics_from_confusion",
     "refresh_target_supervision",
     "save_checkpoint",
     "target_supervision_diagnostics",
