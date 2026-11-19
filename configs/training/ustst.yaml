@@ -1,0 +1,42 @@
+# USTST (Guo et al., MTAP 2023) on the POST E0 protocol: same RAF-DB source
+# checkpoint, ExpW manifest, batch size, optimizer, schedule, STR rounds and seed.
+training:
+  max_epochs: 256
+  batch_size: 64
+  learning_rate: 0.001
+  momentum: 0.9
+  weight_decay: 0.001
+  num_workers: 4
+  seed: 42
+  device: cuda:0
+  amp: true
+  kmeans_interval: 1        # paper: k-means before every epoch
+  str_epochs: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]  # 10 resamplings
+loss:
+  confidence_threshold: 0.95  # thr
+  entropy_threshold: 0.5      # thr_e, normalised entropy H(p)/log K (not given in paper)
+  similarity_margin: 0.2      # triplet margin alpha (not given in paper)
+  lambda_c: 0.01
+  lambda_sim: 0.01
+  lambda_m: 0.01
+  lambda_a: 0.1
+  mmd_kernel_mul: 2.0
+  mmd_kernel_num: 5
+augmentation:
+  randaugment_num_ops: 2
+  randaugment_magnitude: 9
+adversarial:
+  hidden_dim: 256
+  dropout: 0.5
+  lambda_grl: 1.0
+str:
+  confidence_threshold: 0.2   # thr_r
+  # "four random-sized patches" (Sec. 3.2): side = U(low, high) x inter-ocular distance,
+  # drawn per ROI and seeded by (seed, round, target). Range not given in the paper.
+  patch_scale_range: [0.3, 0.5]
+model:
+  cross_start_block: 0        # W-MCA/SW-MCA in every CAST block (Figs. 2-3)
+preprocessing:
+  image_size: 224
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
