@@ -7,7 +7,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset, WeightedRandomS
 
 from .au_guidance import AUCache, AUSpatialCache, build_au_mask
 from .manifests import read_jsonl, validate_rows
-from .transforms import GuidanceTransform, build_transform
+from .transforms import GuidanceTransform, WeakStrongTransform, build_transform
 
 
 class FaceDataset(Dataset):
@@ -185,6 +185,42 @@ def build_loader(
         generator=generator,
         worker_init_fn=_seed_worker,
         drop_last=drop_last,
+    )
+
+
+def build_weak_strong_target_loader(
+    manifest,
+    *,
+    batch_size,
+    num_workers=0,
+    seed=0,
+    image_size=224,
+    mean=(0.485, 0.456, 0.406),
+    std=(0.229, 0.224, 0.225),
+    randaugment_num_ops=2,
+    randaugment_magnitude=9,
+):
+    """Shuffled ExpW adaptation loader yielding ``((weak, strong), sample_ids)``."""
+    import torch
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    transform = WeakStrongTransform(
+        image_size,
+        mean,
+        std,
+        num_ops=randaugment_num_ops,
+        magnitude=randaugment_magnitude,
+    )
+    dataset = FaceDataset(manifest, "target_adaptation", transform=transform)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        generator=torch.Generator().manual_seed(seed),
+        worker_init_fn=_seed_worker,
+        drop_last=True,
     )
 
 
