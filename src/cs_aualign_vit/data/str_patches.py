@@ -9,19 +9,27 @@ LANDMARK_INDICES = (0, 1, 3, 4)
 ROI_SCALE = 0.4
 
 
-def compute_rois(landmarks, size):
-    """Return four half-open ``(left, top, right, bottom)`` boxes, or ``None`` if invalid."""
+def compute_rois(landmarks, size, scales=None):
+    """Return four half-open ``(left, top, right, bottom)`` boxes, or ``None`` if invalid.
+
+    Each box side is ``scale * inter-ocular distance``. ``scales`` gives one factor per
+    ROI (USTST's random-sized patches); by default every ROI uses ``ROI_SCALE``.
+    """
     try:
         points = [(float(landmarks[i][0]), float(landmarks[i][1])) for i in LANDMARK_INDICES]
     except (TypeError, IndexError, ValueError):
         return None
     if not all(math.isfinite(v) for point in points for v in point):
         return None
-    side = round(ROI_SCALE * math.dist(points[0], points[1]))
-    if side < 1:
-        return None
+    scales = (ROI_SCALE,) * len(points) if scales is None else tuple(scales)
+    if len(scales) != len(points) or not all(math.isfinite(v) and v > 0 for v in scales):
+        raise ValueError("scales must hold four finite positive factors")
+    distance = math.dist(points[0], points[1])
     rois = []
-    for x, y in points:
+    for (x, y), scale in zip(points, scales, strict=True):
+        side = round(scale * distance)
+        if side < 1:
+            return None
         left, top = round(x) - side // 2, round(y) - side // 2
         rois.append((left, top, left + side, top + side))
     return rois

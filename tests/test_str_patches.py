@@ -56,3 +56,22 @@ def test_compose_pastes_four_regions_on_a_copy():
     for box in rs:
         assert out.getpixel((box[0] + 3, box[1] + 3)) == (255, 0, 0)
     assert out.getpixel((50, 50)) == (0, 0, 0)
+
+
+def test_random_patch_scales_are_deterministic_and_default_keeps_post_rois():
+    from cs_aualign_vit.data.str_patches import ROI_SCALE, compute_rois
+    from cs_aualign_vit.training.self_training_resampling import patch_scales
+
+    landmarks = [[30, 30], [70, 30], [50, 50], [35, 75], [65, 75]]
+    assert compute_rois(landmarks, (100, 100)) == compute_rois(
+        landmarks, (100, 100), (ROI_SCALE,) * 4
+    )
+    assert patch_scales(None, 42, 1, "t") is None
+    scales = patch_scales((0.3, 0.5), 42, 1, "t")
+    assert scales == patch_scales((0.3, 0.5), 42, 1, "t")
+    assert scales != patch_scales((0.3, 0.5), 42, 2, "t")
+    assert len(set(scales)) == 4 and all(0.3 <= v <= 0.5 for v in scales)
+    sides = [right - left for left, _top, right, _bottom in compute_rois(landmarks, (100, 100), scales)]
+    assert sides == [round(v * 40) for v in scales]
+    with pytest.raises(ValueError, match="scales"):
+        compute_rois(landmarks, (100, 100), (0.4, 0.4))
