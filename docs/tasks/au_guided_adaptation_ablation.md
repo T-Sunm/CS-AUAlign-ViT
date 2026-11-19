@@ -42,6 +42,25 @@ Không calibration lại các giá trị này giữa các experiment. AU attenti
 không dùng ExpW validation hoặc test accuracy; kết quả được lưu tại
 [`au-attention-pilot-matrix/report.md`](../../runs/adaptation/au-attention-pilot-matrix/report.md).
 
+### Deferred: class-conditional AU alignment
+
+Chưa mở rộng E2 sang class-conditional AU alignment. Coverage audit sơ bộ trên
+10.000 batch mô phỏng, batch size 64 và ngưỡng ít nhất 8 mẫu mỗi lớp trong cả
+hai domain cho kết quả: anger 2 batch (0,02%), disgust 1 (0,01%), fear 0,
+happiness 9.997 (99,97%), neutral 9.682 (96,82%), sadness 3.816 (38,16%) và
+surprise 518 (5,18%). Kết quả gợi ý Fear và Disgust hầu như không có support
+để tạo centroid class-conditional theo batch; đây cũng là hai lớp liên quan
+đến nhầm lẫn mà biến thể này muốn nghiên cứu.
+
+Đây chỉ là audit theo nhãn, không phải coverage thực tế của loss: phép mô
+phỏng dùng lấy mẫu có hoàn lại, giả định cả 12 AU hợp lệ khi lớp đạt ngưỡng,
+không tính AU validity/intensity hay Kish effective sample size, và dùng nhãn
+ExpW ground truth thay cho pseudo-labels. Nó cũng chưa khớp batch size 45 của
+run E2 hoặc các batch sau STR. Vì vậy, chưa triển khai hoặc chạy full training
+CCA dựa trên kết quả này. Có thể xem xét lại sau khi audit AU-level trên batch
+thực tế, với sampling policy, pseudo-labels và STR tương ứng; ngưỡng vẫn phải
+dựa trên `n_eff` theo từng AU như E2.
+
 Kết quả và artifact của ablation được tổng hợp tại
 [`au_alignment_ablation.md`](../experiments/au_alignment_ablation.md). E0 hiện
 có accuracy `63.67%`, balanced accuracy `42.98%`, macro F1 `44.20%` và

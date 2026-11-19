@@ -21,6 +21,7 @@ def parse_args():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--split", choices=("train", "validation", "test"), default="train")
     parser.add_argument("--flush-every", type=int, default=100)
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument(
@@ -117,7 +118,7 @@ def run(args):
     rows = [
         row
         for row in read_jsonl(manifest)
-        if row.get("split") == "train" and row.get("usable")
+        if row.get("split") == args.split and row.get("usable")
     ]
     pending = 0
     retried = retry_success = 0

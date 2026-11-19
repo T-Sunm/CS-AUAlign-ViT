@@ -73,14 +73,20 @@ chuỗi lấy mẫu tiếp theo.
 | Target loader và supervision | E0 | Giữ nguyên protocol E0 |
 | Backbone, losses, optimizer và scheduler | E0 | Giữ nguyên |
 | AU guidance | Off | Off |
-| Horizon, batch size, seed | 256 epochs, batch size 64, seed 42 | Giữ nguyên |
+| Horizon, batch size, seed | 100 epochs, batch size 64, seed 42 | Giữ nguyên |
 | STR | Lịch và thuật toán E0 | Giữ nguyên; rebuild sampler sau mỗi round |
 | Best checkpoint | ExpW validation accuracy | Cùng tiêu chí |
 
+Trong task này, E0 là control 100 epoch dùng cấu hình random sampling tại
+[`adaptation.yaml`](../../configs/training/adaptation.yaml); B1 chỉ khác policy
+source sampling. Cả hai phải khởi tạo adaptation từ cùng source-pretraining
+checkpoint. E0 lịch sử tại `runs/adaptation/run-001` đã chạy 256 epoch; giữ nó
+làm kết quả tham khảo, không dùng trực tiếp làm matched control cho B1-100.
+
 Trước run, xác minh source-pretraining checkpoint, split/manifests, seed,
-resolved config và identity của E0. Không khởi tạo B1 từ best adaptation
-checkpoint epoch 63. Đánh giá ExpW test một lần sau khi khóa protocol; không
-dùng test để chọn sampling policy hoặc checkpoint.
+resolved config và identity của hai run 100 epoch. Không khởi tạo B1 từ best
+adaptation checkpoint epoch 63. Đánh giá ExpW test một lần sau khi khóa
+protocol; không dùng test để chọn sampling policy hoặc checkpoint.
 
 ## 6. Logging và phân tích
 

@@ -75,6 +75,30 @@ The RAF-DB → ExpW data pipeline is described in [data/README.md](data/README.m
 native annotation mapping, frozen splits, independent MTCNN preprocessing,
 landmark metadata, source/target/evaluation loaders and audit commands.
 
+AU discriminability audit: first export LibreFace intensities for the ExpW
+evaluation split using the same LibreFace environment as the train cache:
+
+```bash
+python scripts/extract_au_cache.py \
+  --manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --output runs/au_cache/expw_test.csv --split test --device cuda:0
+```
+
+Then run the probe. Missing FANAU descriptor caches under the output directory
+are built automatically from the original 64×64 heatmaps and reused on later
+runs. The script reports quality checks, RAF held-out and ExpW test metrics,
+paired bootstrap intervals, and AU group ablations in `report.json`.
+
+```bash
+uv run --active python scripts/audit_au_discriminability.py \
+  --source-manifest data/processed/raf-v5-deduplicated/processed.jsonl \
+  --source-au-cache runs/au_cache/raf_db_train.csv \
+  --target-manifest /home/minhvduc/FER-DomainAdaptation/CS-AUAlign-ViT/data/processed/expw-v1/processed.jsonl \
+  --target-au-cache runs/au_cache/expw_test.csv \
+  --checkpoint tools/au_heatmap/checkpoints/disfa_adaptation_f0.pth \
+  --device cuda:0 --output runs/au_discriminability
+```
+
 Use Python 3.12 and `uv sync --python 3.12 --extra preprocess` for preparation.
 Fixture checks are `uv run --python 3.12 pytest -q`; no real data or detector
 weights are needed for those tests. Full-data acceptance requires execution on

@@ -1,5 +1,5 @@
 training:
-  max_epochs: 256
+  max_epochs: 100
   batch_size: 64
   learning_rate: 0.001
   momentum: 0.9
@@ -9,7 +9,7 @@ training:
   device: cuda:0
   amp: true
   kmeans_interval: 10
-  str_epochs: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
+  str_epochs: [25, 50, 75]
 loss:
   alpha: 1.0
   beta: 0.5
