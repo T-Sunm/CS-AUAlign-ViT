@@ -492,3 +492,24 @@ def test_drop_last_and_combined_source_loader(tmp_path):
             build_loader(manifest, role, batch_size=1, drop_last=True)
     loader = build_source_loader([manifest, tmp_path / "missing.jsonl"], batch_size=1, drop_last=True)
     assert loader.drop_last and len(loader.dataset) >= 1
+
+
+def test_weak_strong_transform_shares_geometry_and_loader_shapes(tmp_path):
+    import torch
+    from str_helpers import make_target
+
+    from cs_aualign_vit.data.datasets import build_weak_strong_target_loader
+    from cs_aualign_vit.data.transforms import WeakStrongTransform
+
+    image = Image.new("RGB", (100, 100), (120, 30, 200))
+    torch.manual_seed(0)
+    weak, strong = WeakStrongTransform(num_ops=0)(image)
+    assert torch.equal(weak, strong)
+    weak, strong = WeakStrongTransform()(image)
+    assert weak.shape == strong.shape == (3, 224, 224)
+
+    manifest = make_target(tmp_path / "target", [0, 1, 0, 1, 0])
+    loader = build_weak_strong_target_loader(manifest, batch_size=2)
+    (views, sample_ids) = next(iter(loader))
+    assert len(views) == 2 and views[0].shape == views[1].shape == (2, 3, 224, 224)
+    assert len(sample_ids) == 2 and loader.drop_last and len(loader) == 2

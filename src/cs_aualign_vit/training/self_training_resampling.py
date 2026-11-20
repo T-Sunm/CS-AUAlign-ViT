@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import subprocess
@@ -23,6 +24,16 @@ REJECT_REASONS = ("invalid_landmark", "out_of_bounds", "overlap", "no_valid_dono
 
 def str_sample_id(round_id, target_id):
     return hashlib.sha256(f"str:{round_id}:{target_id}".encode()).hexdigest()
+
+
+def patch_scales(scale_range, global_seed, round_id, target_id):
+    """Deterministic per-target ROI scale factors, so a resumed round is identical."""
+    if scale_range is None:
+        return None
+    low, high = scale_range
+    digest = hashlib.sha256(f"patch:{global_seed}:{round_id}:{target_id}".encode()).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
+    return tuple(rng.uniform(low, high) for _ in range(4))
 
 
 def _donor_order(donors, global_seed, round_id, target_id):
@@ -55,6 +66,7 @@ class SelfTrainingResampler:
         peak_threshold=0.8,
         source_sampling_mode="random",
         source_sampling_replacement=True,
+        patch_scale_range=None,
     ):
         dataset = target_feature_loader.dataset
         if not isinstance(dataset, FaceDataset) or dataset.role != "target_features":
@@ -75,6 +87,15 @@ class SelfTrainingResampler:
         self.num_workers = num_workers
         self.num_classes = num_classes
         self.confidence_threshold = confidence_threshold
+        if patch_scale_range is not None:
+            patch_scale_range = tuple(float(v) for v in patch_scale_range)
+            if (
+                len(patch_scale_range) != 2
+                or not all(math.isfinite(v) for v in patch_scale_range)
+                or not 0 < patch_scale_range[0] <= patch_scale_range[1]
+            ):
+                raise ValueError("patch_scale_range must be (low, high) with 0 < low <= high")
+        self.patch_scale_range = patch_scale_range
         self.source_sampling_mode = source_sampling_mode
         self.source_sampling_replacement = source_sampling_replacement
         self.au_cache = Path(au_cache).resolve() if au_cache is not None else None
@@ -131,6 +152,12 @@ class SelfTrainingResampler:
             "num_classes": self.num_classes,
             "spatial_mode": self.spatial_mode,
             "peak_threshold": self.peak_threshold,
+            # Only recorded when enabled, so existing POST transactions stay valid.
+            **(
+                {"patch_scale_range": list(self.patch_scale_range)}
+                if self.patch_scale_range is not None
+                else {}
+            ),
         }
 
     def _validate_transaction_config(self, transaction):
@@ -262,7 +289,10 @@ class SelfTrainingResampler:
         for target_id in candidates:
             meta = self.target_dataset.metadata(target_id)
             target_image = self._load_rgb(meta["processed_path"])
-            rois_t = compute_rois(meta["landmarks_crop"], target_image.size)
+            scales = patch_scales(
+                self.patch_scale_range, transaction["global_seed"], round_id, target_id
+            )
+            rois_t = compute_rois(meta["landmarks_crop"], target_image.size, scales)
             reason = validate_rois(rois_t, target_image.size)
             if reason is not None:
                 rejects[reason] += 1
@@ -270,7 +300,7 @@ class SelfTrainingResampler:
             row = None
             for donor in _donor_order(self._donors[selected], transaction["global_seed"], round_id, target_id):
                 donor_image = self._load_rgb(donor["_path"])
-                rois_s = compute_rois(donor["landmarks_crop"], donor_image.size)
+                rois_s = compute_rois(donor["landmarks_crop"], donor_image.size, scales)
                 if validate_rois(rois_s, donor_image.size) is not None:
                     continue
                 row = self._commit(
